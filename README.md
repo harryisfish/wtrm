@@ -22,11 +22,11 @@ cargo install --path .
 wtrm
 ```
 
-不带路径时，扫描主目录下已经存在的 `project`、`Projects`、`Developer`、`dev`、`src`、`code`、`repos`、`work`、`git`、`workspace`。当前目录不在这些根下面时，也会扫进去。`--all` 改为扫描整个主目录，仍会跳过依赖目录和系统目录。也可以直接传入要扫的目录。
+不带路径时，扫描 `HOME` 下已经存在的 `project`、`Projects`、`Developer`、`dev`、`src`、`code`、`repos`、`work`、`git`、`workspace`。当前目录不在这些根下面时，也会扫进去。`--all` 改为从 `HOME` 往下扫，最多 8 层，仍会跳过依赖目录和系统目录。也可以直接传入要扫的目录。没有 `HOME` 时，`--all` 会失败。
 
 活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。只列出有附加 worktree 的仓库。主检出会显示，但不能删除。
 
-删除走 `git worktree remove`，不会直接删掉目录。Enter 只删除干净的 worktree。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。
+删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。Enter 删除干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。
 
 常用筛选：
 
@@ -39,7 +39,7 @@ wtrm --created-before 30d --inactive 7d
 wtrm --all
 ```
 
-`--older-than` 是 `--inactive` 的别名。时长用 `s`、`m`、`h`、`d`、`w`。几个条件同时给出时是「并且」。已合并只看本地默认分支的祖先，认不出 squash merge。
+`--older-than` 是 `--inactive` 的别名。时长用 `s`、`m`、`h`、`d`、`w`。几个条件同时给出时是「并且」。已合并看默认分支的祖先：优先本地分支，本地没有时用对应的远程跟踪引用。不联网，也认不出 squash merge。
 
 非交互输出在 `--list`、`--json`，或标准输出不是终端时使用。
 
@@ -62,7 +62,7 @@ wtrm --all
 | `r` | 重新扫描 |
 | `q` | 退出 |
 
-启动时如果同时给了 `--created-before` 和 `--inactive`，`s` 改用这两个时长。只给 `--inactive` 时，它改的是 `i`，`s` 的空闲阈值仍是 7 天。
+启动时如果同时给了 `--created-before` 和 `--inactive`，`s` 改用这两个时长。只给 `--inactive` 时，它改的是 `i`，`s` 仍是创建 30 天、空闲 7 天。只给 `--created-before` 时，`s` 的创建时长改用它，空闲仍是 7 天。
 
 `x` 删除这些目录，包括子目录里的同名目录：`node_modules`、`target`、`.next`、`.turbo`、`.venv`、`venv`、`__pycache__`、`Pods`、`.gradle`。worktree 还在。主检出和路径已经不存在的 worktree 不会被清理。
 
