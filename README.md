@@ -6,6 +6,10 @@
 
 只列出有附加 worktree 的仓库。主检出会显示出来，但不能删除。删除走 `git worktree remove`，不会直接 `rm -rf`。Enter 只删除干净的；`f` 才会对脏工作区或锁定的 worktree 使用 `--force --force`。
 
+## 安装
+
+GitHub Release 里有 macOS、Linux 和 Windows 的二进制包。标签从 `v0.0.1` 起。
+
 ## 用法
 
 ```bash
