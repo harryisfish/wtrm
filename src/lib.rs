@@ -18,38 +18,38 @@ const DAY: i64 = 86_400;
 #[command(
     name = "wtrm",
     version,
-    about = "扫描本机的 git worktree，查看活跃程度并多选删除"
+    about = "Scan git worktrees, show how active they are, and delete a selection"
 )]
 struct Cli {
-    /// 要扫描的目录。缺省时使用 ~/project、~/Projects 等已存在的开发目录
+    /// Directories to scan. Defaults to ~/project, ~/Projects, and other existing dev folders
     #[arg(value_name = "DIR")]
     paths: Vec<PathBuf>,
 
-    /// 每个根目录向下寻找仓库的最大层数
+    /// How many levels to walk below each root
     #[arg(long, default_value_t = 8)]
     max_depth: u8,
 
-    /// 扫描整个主目录（仍跳过依赖目录和系统目录）
+    /// Scan the home directory, still skipping dependency and system folders
     #[arg(long)]
     all: bool,
 
-    /// 只打印，不进入交互界面
+    /// Print a table instead of the interactive UI
     #[arg(long)]
     list: bool,
 
-    /// 以 JSON 打印
+    /// Print JSON
     #[arg(long)]
     json: bool,
 
-    /// 只保留已经合并进默认分支的 worktree
+    /// Keep only worktrees already merged into the default branch
     #[arg(long)]
     merged: bool,
 
-    /// 只保留这么久没活跃的 worktree，例如 14d、48h、2w
+    /// Keep only worktrees idle for this long, for example 14d, 48h, 2w
     #[arg(long, visible_alias = "older-than", value_name = "DURATION")]
     inactive: Option<String>,
 
-    /// 只保留至少这么久以前创建的 worktree，例如 30d
+    /// Keep only worktrees created at least this long ago, for example 30d
     #[arg(long, value_name = "DURATION")]
     created_before: Option<String>,
 }
@@ -57,14 +57,16 @@ struct Cli {
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let inactive_for = match &cli.inactive {
-        Some(raw) => {
-            Some(timeutil::parse_duration(raw).context("无法解析 --inactive，示例：14d、48h、2w")?)
-        }
+        Some(raw) => Some(
+            timeutil::parse_duration(raw)
+                .context("cannot parse --inactive; try 14d, 48h, or 2w")?,
+        ),
         None => None,
     };
     let created_before = match &cli.created_before {
         Some(raw) => Some(
-            timeutil::parse_duration(raw).context("无法解析 --created-before，示例：30d、8w")?,
+            timeutil::parse_duration(raw)
+                .context("cannot parse --created-before; try 30d or 8w")?,
         ),
         None => None,
     };
@@ -106,7 +108,7 @@ fn resolve_roots(cli: &Cli) -> anyhow::Result<Vec<PathBuf>> {
     if cli.all {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .context("找不到主目录，无法 --all")?;
+            .context("home directory not found, cannot use --all")?;
         return Ok(vec![home]);
     }
     if !cli.paths.is_empty() {
@@ -119,7 +121,7 @@ fn resolve_roots(cli: &Cli) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     if roots.is_empty() {
-        roots.push(std::env::current_dir().context("找不到当前目录")?);
+        roots.push(std::env::current_dir().context("current directory not found")?);
     }
     Ok(roots)
 }
@@ -150,7 +152,7 @@ fn print_table(result: &ScanResult) {
     let now = timeutil::now_unix();
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let _ = writeln!(out, "活跃\t仓库\t分支\t状态\t文件夹\t路径");
+    let _ = writeln!(out, "active\trepo\tbranch\tstatus\tfolder\tpath");
     for wt in &result.worktrees {
         let _ = writeln!(
             out,
@@ -164,7 +166,7 @@ fn print_table(result: &ScanResult) {
         );
     }
     if result.worktrees.is_empty() {
-        let _ = writeln!(out, "没有发现带附加 worktree 的仓库");
+        let _ = writeln!(out, "no repos with linked worktrees");
     }
 }
 

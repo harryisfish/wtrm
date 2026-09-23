@@ -48,17 +48,21 @@ pub fn parse_duration(raw: &str) -> Result<i64> {
     let s = raw.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     if split == 0 {
-        return Err(anyhow!("时长需要以数字开头，例如 14d、48h、2w"));
+        return Err(anyhow!(
+            "duration must start with a number, for example 14d, 48h, 2w"
+        ));
     }
     let (num, unit) = s.split_at(split);
-    let n: i64 = num.parse().map_err(|_| anyhow!("无法解析数字 {num}"))?;
+    let n: i64 = num
+        .parse()
+        .map_err(|_| anyhow!("cannot parse number {num}"))?;
     let mult: i64 = match unit {
         "" | "s" => 1,
         "m" => 60,
         "h" => 3_600,
         "d" => 86_400,
         "w" => 86_400 * 7,
-        _ => return Err(anyhow!("不认识的单位 {unit}，可用 s/m/h/d/w")),
+        _ => return Err(anyhow!("unknown unit {unit}; use s, m, h, d, or w")),
     };
     Ok(n.saturating_mul(mult))
 }

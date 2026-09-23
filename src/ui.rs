@@ -80,9 +80,9 @@ impl App {
         };
         app.apply_scan(result);
         app.status = if let Some(err) = errors.first() {
-            format!("{} 个读取错误。{err}", errors.len())
+            format!("{} read errors. {err}", errors.len())
         } else {
-            format!("扫描 {}", app.roots_label)
+            format!("scanned {}", app.roots_label)
         };
         app
     }
@@ -240,7 +240,7 @@ impl App {
                 self.query = Query::default();
                 self.selected.clear();
                 self.cursor = 0;
-                self.status = "已显示全部".to_string();
+                self.status = "showing all".to_string();
                 Action::None
             }
             KeyCode::Char('x') => {
@@ -270,7 +270,7 @@ impl App {
             .find(|wt| wt.path == path)
             .is_some_and(|wt| wt.deletable());
         if !deletable {
-            self.status = "主检出只作参照，不会删除".to_string();
+            self.status = "the main checkout is only a reference and cannot be deleted".to_string();
             return;
         }
         if !self.selected.remove(&path) {
@@ -288,7 +288,7 @@ impl App {
             })
             .collect();
         if paths.is_empty() {
-            self.status = "当前没有可删除的 worktree".to_string();
+            self.status = "nothing here can be deleted".to_string();
             return;
         }
         let all_on = paths.iter().all(|path| self.selected.contains(path));
@@ -308,7 +308,7 @@ impl App {
             self.toggle_current();
         }
         if self.selected.is_empty() {
-            self.status = "先选中要删除的 worktree".to_string();
+            self.status = "select a worktree to delete".to_string();
             return;
         }
         self.pending = Pending::Delete;
@@ -319,7 +319,7 @@ impl App {
             self.toggle_current();
         }
         if self.selected.is_empty() {
-            self.status = "先选中要清理依赖的 worktree".to_string();
+            self.status = "select a worktree to clean".to_string();
             return;
         }
         self.pending = Pending::Clean;
@@ -339,7 +339,7 @@ impl App {
             }
         }
         self.status = format!(
-            "筛选 {}，已选中 {} 个。d 删除，x 清依赖",
+            "filter {}, {} selected. d delete, x clean deps",
             self.query.label(),
             self.selected.len()
         );
@@ -367,22 +367,22 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
         .map(|path| scan::shorten_path(path))
         .collect::<Vec<_>>()
         .join(", ");
-    eprintln!("正在扫描 {roots_label} …");
+    eprintln!("scanning {roots_label} …");
     let result = scan::scan(&opts.roots, opts.max_depth);
     eprintln!(
-        "找到 {} 个 worktree（{} 个仓库）",
+        "found {} worktrees ({} repos)",
         result.worktrees.len(),
         result.repos
     );
     if !io::stdout().is_terminal() {
-        anyhow::bail!("标准输出不是终端，无法进入交互界面。加上 --list 或 --json");
+        anyhow::bail!("stdout is not a terminal. use --list or --json");
     }
     let mut app = App::from_scan(result, roots_label);
     app.query = opts.query;
     app.inactive_secs = opts.inactive_secs;
     app.stale_created_secs = opts.stale_created_secs;
     app.stale_idle_secs = opts.stale_idle_secs;
-    let mut terminal = ratatui::try_init().context("无法进入终端界面")?;
+    let mut terminal = ratatui::try_init().context("cannot enter the terminal ui")?;
     let _restore = Restore;
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -399,15 +399,15 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
             Action::None => {}
             Action::Quit => break,
             Action::Rescan => {
-                app.status = "正在重新扫描…".to_string();
+                app.status = "rescanning…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
                 let result = scan::scan(&opts.roots, opts.max_depth);
                 app.apply_scan(result);
-                app.status = format!("已刷新，{} 个 worktree", app.items.len());
+                app.status = format!("refreshed, {} worktrees", app.items.len());
             }
             Action::Delete { force } => {
                 let paths: Vec<_> = app.selected.iter().cloned().collect();
-                app.status = "正在删除…".to_string();
+                app.status = "deleting…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
                 let message = remove::summarize(&remove::delete_many(&app.items, &paths, force));
                 let result = scan::scan(&opts.roots, opts.max_depth);
@@ -416,7 +416,7 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
             }
             Action::CleanDeps => {
                 let paths: Vec<_> = app.selected.iter().cloned().collect();
-                app.status = "正在清理依赖…".to_string();
+                app.status = "cleaning dependencies…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
                 let message = remove::summarize_clean(&remove::clean_many(&app.items, &paths));
                 let result = scan::scan(&opts.roots, opts.max_depth);
@@ -447,16 +447,16 @@ fn draw(frame: &mut Frame, app: &App) {
 fn draw_table(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let visible = app.visible();
     let shown = if app.filter.is_empty() {
-        format!("{} 个", app.items.len())
+        format!("{}", app.items.len())
     } else {
         format!("{}/{}", visible.len(), app.items.len())
     };
     let title = format!(
-        " wtrm  {shown} worktree · 已选 {} · {} 个仓库 ",
+        " wtrm  {shown} worktrees · {} selected · {} repos ",
         app.selected.len(),
         app.repos
     );
-    let header = Row::new(["", "活跃", "仓库", "分支", "文件夹", "状态", "路径"])
+    let header = Row::new(["", "active", "repo", "branch", "folder", "status", "path"])
         .style(Style::new().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = visible
         .iter()
@@ -526,10 +526,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Pending::None => browse_lines(app),
     };
     let title = match app.pending {
-        Pending::Delete => " 确认删除 ",
-        Pending::Clean => " 确认清理依赖 ",
-        Pending::None if app.filter_mode => " 过滤 ",
-        Pending::None => " 说明 ",
+        Pending::Delete => " confirm delete ",
+        Pending::Clean => " confirm clean ",
+        Pending::None if app.filter_mode => " filter ",
+        Pending::None => " help ",
     };
     let paragraph = Paragraph::new(lines)
         .block(Block::bordered().title(title))
@@ -547,34 +547,37 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
             let when = wt
                 .last_active_utc
                 .clone()
-                .unwrap_or_else(|| "未知".to_string());
-            let created = wt.created_utc.clone().unwrap_or_else(|| "未知".to_string());
+                .unwrap_or_else(|| "unknown".to_string());
+            let created = wt
+                .created_utc
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
             format!(
-                "{}  ·  {}  ·  活跃 {when}  ·  创建 {created}  ·  {}",
+                "{}  ·  {}  ·  active {when}  ·  created {created}  ·  {}",
                 scan::shorten_path(&wt.path),
                 wt.branch,
                 wt.flags()
             )
         }
-        None => "没有发现带附加 worktree 的仓库".to_string(),
+        None => "no repos with linked worktrees".to_string(),
     };
     let filter = if app.filter.is_empty() {
         String::new()
     } else {
-        format!("过滤: {}  ", app.filter)
+        format!("filter: {}  ", app.filter)
     };
     vec![
         Line::from(detail),
         Line::from(Span::styled(
             format!(
-                "筛选 {}。已合并 = 提交已在本地默认分支里，不含 squash，不联网。",
+                "filter {}. merged means the commit is in the local default branch. squash merges are not detected.",
                 app.query.label()
             ),
             Style::new().fg(Color::DarkGray),
         )),
         Line::from(format!("{filter}{}", app.status)),
-        Line::from("m 已合并   i 不活跃   s 创建久且闲置   0 全部   x 清依赖"),
-        Line::from("j/k 移动   space 多选   a 全选   d 删除   / 过滤   r 刷新   q 退出"),
+        Line::from("m merged   i idle   s old+idle   0 all   x clean deps"),
+        Line::from("j/k move   space select   a all   d delete   / filter   r refresh   q quit"),
     ]
 }
 
@@ -582,13 +585,13 @@ fn clean_lines(app: &App) -> Vec<Line<'static>> {
     let chosen: Vec<&Worktree> = selected_worktrees(app);
     let mut lines = vec![
         Line::from(format!(
-            "清理 {} 个 worktree 里的依赖目录，不删除 worktree 本身。",
+            "clean dependency directories in {} worktrees. the worktrees stay.",
             chosen.len()
         )),
         Line::from(
-            "包括 node_modules、target、.next、.turbo、.venv、venv、__pycache__、Pods、.gradle。",
+            "removes node_modules, target, .next, .turbo, .venv, venv, __pycache__, Pods, .gradle.",
         ),
-        Line::from("Enter 确认    Esc 取消"),
+        Line::from("Enter confirm    Esc cancel"),
     ];
     for wt in chosen.iter().take(6) {
         lines.push(Line::from(format!(
@@ -598,7 +601,7 @@ fn clean_lines(app: &App) -> Vec<Line<'static>> {
         )));
     }
     if chosen.len() > 6 {
-        lines.push(Line::from(format!("  …还有 {} 个", chosen.len() - 6)));
+        lines.push(Line::from(format!("  …{} more", chosen.len() - 6)));
     }
     lines
 }
@@ -613,7 +616,7 @@ fn selected_worktrees(app: &App) -> Vec<&Worktree> {
 fn confirm_lines(app: &App) -> Vec<Line<'static>> {
     let chosen = selected_worktrees(app);
     let mut lines = vec![Line::from(format!(
-        "将删除 {} 个 worktree。Enter 只删干净的，f 连同脏/锁定的一起强制删除，Esc 取消。",
+        "delete {} worktrees. Enter deletes clean ones, f forces dirty or locked, Esc cancels.",
         chosen.len()
     ))];
     for wt in chosen.iter().take(6) {
@@ -625,7 +628,7 @@ fn confirm_lines(app: &App) -> Vec<Line<'static>> {
         )));
     }
     if chosen.len() > 6 {
-        lines.push(Line::from(format!("  …还有 {} 个", chosen.len() - 6)));
+        lines.push(Line::from(format!("  …{} more", chosen.len() - 6)));
     }
     lines
 }

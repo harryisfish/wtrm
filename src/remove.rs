@@ -41,14 +41,14 @@ pub fn delete_many(
 
 pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
     if wt.main || wt.bare || wt.path == wt.repo_root {
-        return Err("不会删除主检出".to_string());
+        return Err("refusing to delete the main checkout".to_string());
     }
     if !force {
         if wt.locked {
-            return Err("已锁定，按 f 强制删除".to_string());
+            return Err("locked; press f to force".to_string());
         }
         if !wt.missing && wt.dirty != Some(false) {
-            return Err("不是干净工作区，按 f 强制删除".to_string());
+            return Err("not a clean worktree; press f to force".to_string());
         }
     }
 
@@ -64,13 +64,15 @@ pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
         cmd.args(["--force", "--force"]);
     }
     cmd.arg(&wt.path);
-    let out = cmd.output().map_err(|err| format!("无法运行 git: {err}"))?;
+    let out = cmd
+        .output()
+        .map_err(|err| format!("cannot run git: {err}"))?;
     if out.status.success() {
         return Ok(());
     }
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     Err(if err.is_empty() {
-        "git worktree remove 失败".to_string()
+        "git worktree remove failed".to_string()
     } else {
         err
     })
@@ -89,7 +91,10 @@ pub fn clean_many(items: &[Worktree], paths: &[PathBuf]) -> CleanOutcome {
             continue;
         };
         if !wt.deletable() || wt.missing {
-            errors.push(format!("{}：跳过主检出或缺失目录", path.display()));
+            errors.push(format!(
+                "{}: skipped main checkout or missing directory",
+                path.display()
+            ));
             continue;
         }
         match clean_deps(&wt.path) {
@@ -102,7 +107,7 @@ pub fn clean_many(items: &[Worktree], paths: &[PathBuf]) -> CleanOutcome {
 
 pub fn clean_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
     if !root.is_dir() {
-        return Err(format!("目录不存在：{}", root.display()));
+        return Err(format!("directory does not exist: {}", root.display()));
     }
     let mut removed = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -139,10 +144,10 @@ pub fn clean_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
 
 pub fn summarize_clean(outcome: &CleanOutcome) -> String {
     if outcome.errors.is_empty() {
-        format!("已清理 {} 个依赖目录", outcome.removed.len())
+        format!("cleaned {} dependency directories", outcome.removed.len())
     } else {
         format!(
-            "已清理 {} 个依赖目录，失败 {} 个：{}",
+            "cleaned {} dependency directories, {} failed: {}",
             outcome.removed.len(),
             outcome.errors.len(),
             outcome.errors[0]
@@ -157,11 +162,11 @@ pub fn summarize(outcomes: &[DeleteOutcome]) -> String {
         .filter(|item| item.error.is_some())
         .collect();
     if failed.is_empty() {
-        format!("已删除 {ok} 个 worktree")
+        format!("deleted {ok} worktrees")
     } else {
         let first = failed[0].error.as_deref().unwrap_or("");
         format!(
-            "已删除 {ok} 个，失败 {} 个：{}（{first}）",
+            "deleted {ok}, {} failed: {} ({first})",
             failed.len(),
             failed[0].path.display()
         )
@@ -203,6 +208,6 @@ mod tests {
     fn refuses_main_checkout() {
         let wt = fixture("/repos/demo", "demo", true, Some(10));
         let err = delete_one(&wt, true).unwrap_err();
-        assert!(err.contains("主检出"));
+        assert!(err.contains("main checkout"));
     }
 }

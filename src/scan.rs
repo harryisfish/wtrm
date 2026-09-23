@@ -133,16 +133,16 @@ impl Query {
     pub fn label(&self) -> String {
         let mut parts = Vec::new();
         if self.merged_only {
-            parts.push("已合并".to_string());
+            parts.push("merged".to_string());
         }
         if let Some(secs) = self.inactive_for {
-            parts.push(format!("不活跃 ≥{}", timeutil::format_age(secs as u64)));
+            parts.push(format!("idle ≥{}", timeutil::format_age(secs as u64)));
         }
         if let Some(secs) = self.created_before {
-            parts.push(format!("创建 ≥{}", timeutil::format_age(secs as u64)));
+            parts.push(format!("created ≥{}", timeutil::format_age(secs as u64)));
         }
         if parts.is_empty() {
-            "全部".to_string()
+            "all".to_string()
         } else {
             parts.join(" · ")
         }
@@ -255,7 +255,7 @@ pub fn scan(roots: &[PathBuf], max_depth: u8) -> ScanResult {
     let mut commons = BTreeSet::new();
     for root in roots {
         if !root.exists() {
-            errors.push(format!("不存在: {}", root.display()));
+            errors.push(format!("missing: {}", root.display()));
             continue;
         }
         discover(root, max_depth, &mut commons);
@@ -617,11 +617,13 @@ fn git_output_in(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn finish_git(mut cmd: Command, args: &[&str]) -> Result<String, String> {
-    let out = cmd.output().map_err(|err| format!("无法运行 git: {err}"))?;
+    let out = cmd
+        .output()
+        .map_err(|err| format!("cannot run git: {err}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if err.is_empty() {
-            format!("git {} 失败", args.join(" "))
+            format!("git {} failed", args.join(" "))
         } else {
             err
         });
@@ -816,7 +818,7 @@ prunable gitdir file points to non-existent location
         assert_eq!(extra.dirty, Some(false));
         assert!(extra.last_active.is_some());
         assert!(extra.created_at.is_some());
-        assert_eq!(extra.merged, Some(true), "指向 main 的新分支算已合并");
+        assert_eq!(extra.merged, Some(true), "a branch at main is merged");
         assert!(result.worktrees.iter().any(|wt| wt.main && !wt.deletable()));
 
         fs::write(linked.join("note.txt"), "change\n").unwrap();
@@ -843,7 +845,7 @@ prunable gitdir file points to non-existent location
         let dirty = again.worktrees.iter().find(|wt| wt.deletable()).unwrap();
         assert_eq!(dirty.dirty, Some(true));
         let refused = crate::remove::delete_one(dirty, false).unwrap_err();
-        assert!(refused.contains("干净"), "{refused}");
+        assert!(refused.contains("clean"), "{refused}");
         crate::remove::delete_one(dirty, true).unwrap();
         assert!(!linked.exists());
     }
