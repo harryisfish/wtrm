@@ -4,6 +4,7 @@ version = "0.0.1"
 edition = "2021"
 description = "Scan git worktrees on this machine and delete the ones you pick"
 readme = "README.md"
+license = "MIT"
 rust-version = "1.85"
 
 [dependencies]

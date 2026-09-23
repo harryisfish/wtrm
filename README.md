@@ -1,32 +1,49 @@
 # wtrm
 
-扫描本机的 git worktree，按最后活跃程度列出仓库、分支、所在文件夹和路径，并在终端里多选删除。
+扫描这台机器上的 git worktree。按最后活跃程度列出仓库、分支、所在文件夹和路径，在终端里多选删除，或只清掉依赖目录。
 
-活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。
-
-只列出有附加 worktree 的仓库。主检出会显示出来，但不能删除。删除走 `git worktree remove`，不会直接 `rm -rf`。Enter 只删除干净的；`f` 才会对脏工作区或锁定的 worktree 使用 `--force --force`。
+给本地有一堆 worktree、想按「已合并」「很久没动」「创建很久且最近没动」收拾的人用。扫描不联网，也不查 pull request。
 
 ## 安装
 
-GitHub Release 里有 macOS、Linux 和 Windows 的二进制包。标签从 `v0.0.1` 起。
+[GitHub Release](https://github.com/harryisfish/wtrm/releases) 提供 macOS（arm64、x86_64）、Linux（x86_64）和 Windows（x86_64）的二进制包。当前版本是 `v0.0.1`。
+
+从源码构建需要 Rust 1.85 或更新：
+
+```bash
+cargo install --path .
+```
 
 ## 用法
 
+在终端里直接运行，进入交互界面：
+
 ```bash
-cargo run --release
-cargo run --release -- --list
-cargo run --release -- --json
-cargo run --release -- --merged
-cargo run --release -- --inactive 14d
-cargo run --release -- --created-before 30d --inactive 7d
-cargo run --release -- --all
+wtrm
 ```
 
-`--older-than` 是 `--inactive` 的别名。几个条件同时给出时是「并且」。已合并只看本地默认分支的祖先，不联网，也认不出 squash merge。交互里的 `i` 默认 14 天，`s` 默认创建超过 30 天且最近 7 天没动；启动时如果同时给了 `--created-before` 和 `--inactive`，`s` 改用这两个数。
+不带路径时，扫描主目录下已经存在的 `project`、`Projects`、`Developer`、`dev`、`src`、`code`、`repos`、`work`、`git`、`workspace`。当前目录不在这些根下面时，也会扫进去。`--all` 改为扫描整个主目录，仍会跳过依赖目录和系统目录。也可以直接传入要扫的目录。
 
-不带路径时，会扫描主目录下已经存在的 `project`、`Projects`、`Developer`、`dev`、`src`、`code`、`repos`、`work`、`git`、`workspace`。
+活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。只列出有附加 worktree 的仓库。主检出会显示，但不能删除。
 
-交互键：
+删除走 `git worktree remove`，不会直接删掉目录。Enter 只删除干净的 worktree。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。
+
+常用筛选：
+
+```bash
+wtrm --list
+wtrm --json
+wtrm --merged
+wtrm --inactive 14d
+wtrm --created-before 30d --inactive 7d
+wtrm --all
+```
+
+`--older-than` 是 `--inactive` 的别名。时长用 `s`、`m`、`h`、`d`、`w`。几个条件同时给出时是「并且」。已合并只看本地默认分支的祖先，认不出 squash merge。
+
+非交互输出在 `--list`、`--json`，或标准输出不是终端时使用。
+
+## 交互
 
 | 键 | 作用 |
 | --- | --- |
@@ -45,20 +62,22 @@ cargo run --release -- --all
 | `r` | 重新扫描 |
 | `q` | 退出 |
 
-`x` 会删掉 `node_modules`、`target`、`.next`、`.turbo`、`.venv`、`venv`、`__pycache__`、`Pods`、`.gradle`，包括子目录里的同名目录。worktree 本身还在。
+启动时如果同时给了 `--created-before` 和 `--inactive`，`s` 改用这两个时长。只给 `--inactive` 时，它改的是 `i`，`s` 的空闲阈值仍是 7 天。
+
+`x` 删除这些目录，包括子目录里的同名目录：`node_modules`、`target`、`.next`、`.turbo`、`.venv`、`venv`、`__pycache__`、`Pods`、`.gradle`。worktree 还在。主检出和路径已经不存在的 worktree 不会被清理。
 
 找到仓库后不再走进去，所以仓库内部的嵌套克隆不会被看到。那种目录需要单独当作扫描根。符号链接目录也会跳过。
 
-## 同类工具
+## 和其他工具
 
-机器范围的清理已经有人做了：
+机器范围的清理已经有人做了。wtrm 只做本地盘点：最后活跃时间、创建时间、是否已合并、所属文件夹、仓库，以及多选删除或清理依赖。
 
-- [wtkill](https://github.com/ohernandezdev/wtkill)：最接近。递归扫描、年龄、体积，TUI 删除，也有 JSON。Go。
-- [gh-reaper](https://github.com/ai-ecoverse/gh-reaper)：`gh` 扩展。按年龄和体积列出，可核对 PR 是否已合并，确认后删除。
-- [gwm](https://github.com/kbrdn1/gwm-cli)：Rust。单仓库和多仓库 TUI，能创建、跳转、清理，还有撤销。
-- [wisetree](https://github.com/victorcorcos/wisetree)：Rust + Ratatui。单个仓库的仪表盘，按状态批量删除。
-- [worktrunk](https://github.com/max-sixty/worktrunk)：Rust。目前最常用的 worktree 工作流工具，重点是创建、切换、合并，不是全机盘点。
-- [git-worktree-manager](https://github.com/DaveDev42/git-worktree-manager)（`gw`）：按当前目录发现范围，不维护全局清单。
-- [wt-core](https://github.com/kioku/wt-core)、[gwq](https://github.com/d-kuro/gwq)、[norn](https://github.com/Sandbye/norn)、[copse](https://github.com/getsolaris/copse)：创建、跳转、tmux 或代理会话，不是全机清理。
+- [wtkill](https://github.com/ohernandezdev/wtkill)：最接近。递归扫描、年龄、体积，TUI 删除，也有 JSON。
+- [gh-reaper](https://github.com/ai-ecoverse/gh-reaper)：`gh` 扩展。按年龄和体积列出，可核对 PR 是否已合并。
+- [gwm](https://github.com/kbrdn1/gwm-cli)：单仓库和多仓库 TUI，能创建、跳转、清理。
+- [wisetree](https://github.com/victorcorcos/wisetree)：单个仓库的仪表盘，按状态批量删除。
+- [worktrunk](https://github.com/max-sixty/worktrunk)：创建、切换、合并，不是全机盘点。
 
-wtrm 做本地盘点：最后活跃时间、创建时间、是否已合并、所属文件夹、仓库，以及多选删除或清理依赖。扫描时不联网，也不查 PR。
+## 许可证
+
+[MIT](LICENSE)
