@@ -12,13 +12,16 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::remove;
-use crate::scan::{self, ScanResult, Worktree};
+use crate::scan::{self, Query, ScanResult, Worktree};
 use crate::timeutil::{self, age_label};
 
 pub struct Options {
     pub roots: Vec<PathBuf>,
     pub max_depth: u8,
-    pub older_than_secs: Option<i64>,
+    pub query: Query,
+    pub inactive_secs: i64,
+    pub stale_created_secs: i64,
+    pub stale_idle_secs: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +30,14 @@ pub enum Action {
     Quit,
     Rescan,
     Delete { force: bool },
+    CleanDeps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pending {
+    None,
+    Delete,
+    Clean,
 }
 
 pub struct App {
@@ -38,9 +49,13 @@ pub struct App {
     pub selected: BTreeSet<PathBuf>,
     pub filter: String,
     pub filter_mode: bool,
-    pub confirm: bool,
+    pub(crate) pending: Pending,
     pub status: String,
     pub now: i64,
+    pub query: Query,
+    pub inactive_secs: i64,
+    pub stale_created_secs: i64,
+    pub stale_idle_secs: i64,
 }
 
 impl App {
@@ -55,9 +70,13 @@ impl App {
             selected: BTreeSet::new(),
             filter: String::new(),
             filter_mode: false,
-            confirm: false,
+            pending: Pending::None,
             status: String::new(),
             now: timeutil::now_unix(),
+            query: Query::default(),
+            inactive_secs: 14 * 86_400,
+            stale_created_secs: 30 * 86_400,
+            stale_idle_secs: 7 * 86_400,
         };
         app.apply_scan(result);
         app.status = if let Some(err) = errors.first() {
@@ -77,17 +96,18 @@ impl App {
                 .iter()
                 .any(|wt| &wt.path == path && wt.deletable())
         });
-        self.confirm = false;
+        self.pending = Pending::None;
         self.now = timeutil::now_unix();
         self.clamp_cursor();
     }
 
     pub fn visible(&self) -> Vec<usize> {
         let query = self.filter.to_lowercase();
-        self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, wt)| {
+        let indexes = scan::matching_indexes(&self.items, &self.query, self.now);
+        indexes
+            .into_iter()
+            .filter(|idx| {
+                let wt = &self.items[*idx];
                 if query.is_empty() {
                     return true;
                 }
@@ -101,7 +121,6 @@ impl App {
                 );
                 blob.to_lowercase().contains(&query)
             })
-            .map(|(idx, _)| idx)
             .collect()
     }
 
@@ -111,7 +130,7 @@ impl App {
         }
         let action = if self.filter_mode {
             self.on_filter_key(code)
-        } else if self.confirm {
+        } else if self.pending != Pending::None {
             self.on_confirm_key(code)
         } else {
             self.on_browse_key(code)
@@ -139,15 +158,20 @@ impl App {
     fn on_confirm_key(&mut self, code: KeyCode) -> Action {
         match code {
             KeyCode::Enter => {
-                self.confirm = false;
-                Action::Delete { force: false }
+                let pending = self.pending;
+                self.pending = Pending::None;
+                match pending {
+                    Pending::Clean => Action::CleanDeps,
+                    Pending::Delete => Action::Delete { force: false },
+                    Pending::None => Action::None,
+                }
             }
-            KeyCode::Char('f') | KeyCode::Char('F') => {
-                self.confirm = false;
+            KeyCode::Char('f') | KeyCode::Char('F') if self.pending == Pending::Delete => {
+                self.pending = Pending::None;
                 Action::Delete { force: true }
             }
             KeyCode::Esc => {
-                self.confirm = false;
+                self.pending = Pending::None;
                 Action::None
             }
             KeyCode::Char('q') => Action::Quit,
@@ -188,6 +212,39 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.toggle_all_visible();
+                Action::None
+            }
+            KeyCode::Char('m') => {
+                self.apply_preset(Query {
+                    merged_only: true,
+                    ..Query::default()
+                });
+                Action::None
+            }
+            KeyCode::Char('i') => {
+                self.apply_preset(Query {
+                    inactive_for: Some(self.inactive_secs),
+                    ..Query::default()
+                });
+                Action::None
+            }
+            KeyCode::Char('s') => {
+                self.apply_preset(Query {
+                    inactive_for: Some(self.stale_idle_secs),
+                    created_before: Some(self.stale_created_secs),
+                    merged_only: false,
+                });
+                Action::None
+            }
+            KeyCode::Char('0') => {
+                self.query = Query::default();
+                self.selected.clear();
+                self.cursor = 0;
+                self.status = "已显示全部".to_string();
+                Action::None
+            }
+            KeyCode::Char('x') => {
+                self.arm_clean();
                 Action::None
             }
             KeyCode::Char('/') => {
@@ -254,7 +311,38 @@ impl App {
             self.status = "先选中要删除的 worktree".to_string();
             return;
         }
-        self.confirm = true;
+        self.pending = Pending::Delete;
+    }
+
+    fn arm_clean(&mut self) {
+        if self.selected.is_empty() {
+            self.toggle_current();
+        }
+        if self.selected.is_empty() {
+            self.status = "先选中要清理依赖的 worktree".to_string();
+            return;
+        }
+        self.pending = Pending::Clean;
+    }
+
+    fn apply_preset(&mut self, query: Query) {
+        self.query = query;
+        self.filter.clear();
+        self.filter_mode = false;
+        self.pending = Pending::None;
+        self.cursor = 0;
+        self.selected.clear();
+        for idx in self.visible() {
+            let wt = &self.items[idx];
+            if wt.deletable() {
+                self.selected.insert(wt.path.clone());
+            }
+        }
+        self.status = format!(
+            "筛选 {}，已选中 {} 个。d 删除，x 清依赖",
+            self.query.label(),
+            self.selected.len()
+        );
     }
 
     fn current_path(&self) -> Option<PathBuf> {
@@ -280,7 +368,7 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     eprintln!("正在扫描 {roots_label} …");
-    let result = scan::load(&opts.roots, opts.max_depth, opts.older_than_secs);
+    let result = scan::scan(&opts.roots, opts.max_depth);
     eprintln!(
         "找到 {} 个 worktree（{} 个仓库）",
         result.worktrees.len(),
@@ -290,6 +378,10 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
         anyhow::bail!("标准输出不是终端，无法进入交互界面。加上 --list 或 --json");
     }
     let mut app = App::from_scan(result, roots_label);
+    app.query = opts.query;
+    app.inactive_secs = opts.inactive_secs;
+    app.stale_created_secs = opts.stale_created_secs;
+    app.stale_idle_secs = opts.stale_idle_secs;
     let mut terminal = ratatui::try_init().context("无法进入终端界面")?;
     let _restore = Restore;
     loop {
@@ -309,7 +401,7 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
             Action::Rescan => {
                 app.status = "正在重新扫描…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
-                let result = scan::load(&opts.roots, opts.max_depth, opts.older_than_secs);
+                let result = scan::scan(&opts.roots, opts.max_depth);
                 app.apply_scan(result);
                 app.status = format!("已刷新，{} 个 worktree", app.items.len());
             }
@@ -318,7 +410,16 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
                 app.status = "正在删除…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
                 let message = remove::summarize(&remove::delete_many(&app.items, &paths, force));
-                let result = scan::load(&opts.roots, opts.max_depth, opts.older_than_secs);
+                let result = scan::scan(&opts.roots, opts.max_depth);
+                app.apply_scan(result);
+                app.status = message;
+            }
+            Action::CleanDeps => {
+                let paths: Vec<_> = app.selected.iter().cloned().collect();
+                app.status = "正在清理依赖…".to_string();
+                terminal.draw(|frame| draw(frame, &app))?;
+                let message = remove::summarize_clean(&remove::clean_many(&app.items, &paths));
+                let result = scan::scan(&opts.roots, opts.max_depth);
                 app.apply_scan(result);
                 app.status = message;
             }
@@ -336,7 +437,7 @@ impl Drop for Restore {
 }
 
 fn draw(frame: &mut Frame, app: &App) {
-    let foot_h = if app.confirm { 12 } else { 6 };
+    let foot_h = if app.pending == Pending::None { 9 } else { 12 };
     let chunks =
         Layout::vertical([Constraint::Min(3), Constraint::Length(foot_h)]).split(frame.area());
     draw_table(frame, app, chunks[0]);
@@ -408,6 +509,9 @@ fn row_style(wt: &Worktree, now: i64) -> Style {
     if wt.missing || wt.dirty == Some(true) || wt.locked {
         return Style::new().fg(Color::Yellow);
     }
+    if wt.merged == Some(true) {
+        return Style::new().fg(Color::Cyan);
+    }
     match wt.last_active {
         Some(ts) if now.saturating_sub(ts) >= 86_400 * 14 => Style::new().fg(Color::Red),
         Some(_) => Style::new(),
@@ -416,17 +520,16 @@ fn row_style(wt: &Worktree, now: i64) -> Style {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let lines = if app.confirm {
-        confirm_lines(app)
-    } else {
-        browse_lines(app)
+    let lines = match app.pending {
+        Pending::Delete => confirm_lines(app),
+        Pending::Clean => clean_lines(app),
+        Pending::None => browse_lines(app),
     };
-    let title = if app.confirm {
-        " 确认删除 "
-    } else if app.filter_mode {
-        " 过滤 "
-    } else {
-        " 说明 "
+    let title = match app.pending {
+        Pending::Delete => " 确认删除 ",
+        Pending::Clean => " 确认清理依赖 ",
+        Pending::None if app.filter_mode => " 过滤 ",
+        Pending::None => " 说明 ",
     };
     let paragraph = Paragraph::new(lines)
         .block(Block::bordered().title(title))
@@ -445,8 +548,9 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
                 .last_active_utc
                 .clone()
                 .unwrap_or_else(|| "未知".to_string());
+            let created = wt.created_utc.clone().unwrap_or_else(|| "未知".to_string());
             format!(
-                "{}  ·  {}  ·  活跃 {when}  ·  {}",
+                "{}  ·  {}  ·  活跃 {when}  ·  创建 {created}  ·  {}",
                 scan::shorten_path(&wt.path),
                 wt.branch,
                 wt.flags()
@@ -462,20 +566,52 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::from(detail),
         Line::from(Span::styled(
-            "活跃 = 最近提交、index、目录修改时间中的最新值。主检出不可删除。",
+            format!(
+                "筛选 {}。已合并 = 提交已在本地默认分支里，不含 squash，不联网。",
+                app.query.label()
+            ),
             Style::new().fg(Color::DarkGray),
         )),
         Line::from(format!("{filter}{}", app.status)),
-        Line::from("j/k 移动   space 多选   a 全选可删   d 删除   / 过滤   r 刷新   q 退出"),
+        Line::from("m 已合并   i 不活跃   s 创建久且闲置   0 全部   x 清依赖"),
+        Line::from("j/k 移动   space 多选   a 全选   d 删除   / 过滤   r 刷新   q 退出"),
     ]
 }
 
-fn confirm_lines(app: &App) -> Vec<Line<'static>> {
-    let chosen: Vec<&Worktree> = app
-        .selected
+fn clean_lines(app: &App) -> Vec<Line<'static>> {
+    let chosen: Vec<&Worktree> = selected_worktrees(app);
+    let mut lines = vec![
+        Line::from(format!(
+            "清理 {} 个 worktree 里的依赖目录，不删除 worktree 本身。",
+            chosen.len()
+        )),
+        Line::from(
+            "包括 node_modules、target、.next、.turbo、.venv、venv、__pycache__、Pods、.gradle。",
+        ),
+        Line::from("Enter 确认    Esc 取消"),
+    ];
+    for wt in chosen.iter().take(6) {
+        lines.push(Line::from(format!(
+            "  {}  {}",
+            wt.branch,
+            scan::shorten_path(&wt.path)
+        )));
+    }
+    if chosen.len() > 6 {
+        lines.push(Line::from(format!("  …还有 {} 个", chosen.len() - 6)));
+    }
+    lines
+}
+
+fn selected_worktrees(app: &App) -> Vec<&Worktree> {
+    app.selected
         .iter()
         .filter_map(|path| app.items.iter().find(|wt| &wt.path == path))
-        .collect();
+        .collect()
+}
+
+fn confirm_lines(app: &App) -> Vec<Line<'static>> {
+    let chosen = selected_worktrees(app);
     let mut lines = vec![Line::from(format!(
         "将删除 {} 个 worktree。Enter 只删干净的，f 连同脏/锁定的一起强制删除，Esc 取消。",
         chosen.len()
@@ -522,10 +658,63 @@ mod tests {
         app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
         assert_eq!(app.selected.len(), 1);
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
-        assert!(app.confirm);
+        assert_eq!(app.pending, Pending::Delete);
         assert_eq!(
             app.on_key(KeyCode::Enter, KeyModifiers::NONE),
             Action::Delete { force: false }
+        );
+    }
+
+    #[test]
+    fn presets_select_merged_idle_and_old() {
+        let now = 1_000_000;
+        let mut merged = fixture("/repos/demo/.worktrees/merged", "demo", false, Some(now));
+        merged.merged = Some(true);
+        let mut idle = fixture(
+            "/repos/demo/.worktrees/idle",
+            "demo",
+            false,
+            Some(now - 20 * 86_400),
+        );
+        idle.created_at = Some(now - 2 * 86_400);
+        let mut old = fixture(
+            "/repos/demo/.worktrees/old",
+            "demo",
+            false,
+            Some(now - 20 * 86_400),
+        );
+        old.created_at = Some(now - 40 * 86_400);
+        let mut app = app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(now)),
+            merged,
+            idle,
+            old,
+        ]);
+        app.now = now;
+        app.inactive_secs = 14 * 86_400;
+        app.stale_created_secs = 30 * 86_400;
+        app.stale_idle_secs = 7 * 86_400;
+
+        app.on_key(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(app.selected.len(), 1);
+        assert!(app
+            .selected
+            .contains(&PathBuf::from("/repos/demo/.worktrees/merged")));
+
+        app.on_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.selected.len(), 2);
+
+        app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(
+            app.selected.iter().cloned().collect::<Vec<_>>(),
+            vec![PathBuf::from("/repos/demo/.worktrees/old")]
+        );
+
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.pending, Pending::Clean);
+        assert_eq!(
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            Action::CleanDeps
         );
     }
 

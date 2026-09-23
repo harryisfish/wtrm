@@ -9,8 +9,10 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 
-use crate::scan::ScanResult;
+use crate::scan::{Query, ScanResult};
 use crate::timeutil::age_label;
+
+const DAY: i64 = 86_400;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,34 +41,60 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// 只保留已经合并进默认分支的 worktree
+    #[arg(long)]
+    merged: bool,
+
     /// 只保留这么久没活跃的 worktree，例如 14d、48h、2w
+    #[arg(long, visible_alias = "older-than", value_name = "DURATION")]
+    inactive: Option<String>,
+
+    /// 只保留至少这么久以前创建的 worktree，例如 30d
     #[arg(long, value_name = "DURATION")]
-    older_than: Option<String>,
+    created_before: Option<String>,
 }
 
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let older_than_secs = match &cli.older_than {
+    let inactive_for = match &cli.inactive {
+        Some(raw) => {
+            Some(timeutil::parse_duration(raw).context("无法解析 --inactive，示例：14d、48h、2w")?)
+        }
+        None => None,
+    };
+    let created_before = match &cli.created_before {
         Some(raw) => Some(
-            timeutil::parse_duration(raw).context("无法解析 --older-than，示例：14d、48h、2w")?,
+            timeutil::parse_duration(raw).context("无法解析 --created-before，示例：30d、8w")?,
         ),
         None => None,
+    };
+    let query = Query {
+        inactive_for,
+        created_before,
+        merged_only: cli.merged,
     };
     let roots = resolve_roots(&cli)?;
     let opts = ui::Options {
         roots,
         max_depth: cli.max_depth,
-        older_than_secs,
+        query,
+        inactive_secs: inactive_for.unwrap_or(14 * DAY),
+        stale_created_secs: created_before.unwrap_or(30 * DAY),
+        stale_idle_secs: if created_before.is_some() {
+            inactive_for.unwrap_or(7 * DAY)
+        } else {
+            7 * DAY
+        },
     };
     if cli.json {
-        let result = scan::load(&opts.roots, opts.max_depth, opts.older_than_secs);
+        let result = scan::load(&opts.roots, opts.max_depth, &opts.query);
         serde_json::to_writer_pretty(io::stdout(), &result.worktrees)?;
         println!();
         report_errors(&result);
         return Ok(());
     }
     if cli.list || !io::stdout().is_terminal() {
-        let result = scan::load(&opts.roots, opts.max_depth, opts.older_than_secs);
+        let result = scan::load(&opts.roots, opts.max_depth, &opts.query);
         print_table(&result);
         report_errors(&result);
         return Ok(());
