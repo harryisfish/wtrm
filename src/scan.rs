@@ -47,9 +47,12 @@ pub struct Worktree {
     pub prunable: bool,
     pub missing: bool,
     pub dirty: Option<bool>,
+    pub merged: Option<bool>,
     pub last_commit: Option<i64>,
     pub last_active: Option<i64>,
     pub last_active_utc: Option<String>,
+    pub created_at: Option<i64>,
+    pub created_utc: Option<String>,
 }
 
 impl Worktree {
@@ -77,6 +80,9 @@ impl Worktree {
         }
         if self.prunable {
             flags.push("prunable");
+        }
+        if self.merged == Some(true) {
+            flags.push("merged");
         }
         if flags.is_empty() {
             flags.push("-");
@@ -109,11 +115,43 @@ struct Job {
     repo_root: PathBuf,
     git_common_dir: PathBuf,
     main: bool,
+    base: Option<String>,
 }
 
-pub fn load(roots: &[PathBuf], max_depth: u8, older_than_secs: Option<i64>) -> ScanResult {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Query {
+    pub inactive_for: Option<i64>,
+    pub created_before: Option<i64>,
+    pub merged_only: bool,
+}
+
+impl Query {
+    pub fn is_empty(&self) -> bool {
+        self.inactive_for.is_none() && self.created_before.is_none() && !self.merged_only
+    }
+
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.merged_only {
+            parts.push("merged".to_string());
+        }
+        if let Some(secs) = self.inactive_for {
+            parts.push(format!("idle ≥{}", timeutil::format_age(secs as u64)));
+        }
+        if let Some(secs) = self.created_before {
+            parts.push(format!("created ≥{}", timeutil::format_age(secs as u64)));
+        }
+        if parts.is_empty() {
+            "all".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+pub fn load(roots: &[PathBuf], max_depth: u8, query: &Query) -> ScanResult {
     let mut result = scan(roots, max_depth);
-    result.worktrees = apply_view(result.worktrees, older_than_secs, timeutil::now_unix());
+    result.worktrees = apply_view(result.worktrees, query, timeutil::now_unix());
     result.repos = result
         .worktrees
         .iter()
@@ -123,25 +161,77 @@ pub fn load(roots: &[PathBuf], max_depth: u8, older_than_secs: Option<i64>) -> S
     result
 }
 
-pub fn apply_view(
-    mut worktrees: Vec<Worktree>,
-    older_than_secs: Option<i64>,
-    now: i64,
-) -> Vec<Worktree> {
-    if let Some(min_age) = older_than_secs {
-        let old_repos: HashSet<PathBuf> = worktrees
-            .iter()
-            .filter(|wt| wt.deletable() && is_old(wt, now, min_age))
-            .map(|wt| wt.git_common_dir.clone())
-            .collect();
+pub fn apply_view(mut worktrees: Vec<Worktree>, query: &Query, now: i64) -> Vec<Worktree> {
+    if !query.is_empty() {
+        let matched = matching_repos(&worktrees, query, now);
         worktrees.retain(|wt| {
             if wt.deletable() {
-                is_old(wt, now, min_age)
+                deletable_matches(wt, query, now)
             } else {
-                old_repos.contains(&wt.git_common_dir)
+                matched.contains(&wt.git_common_dir)
             }
         });
     }
+    sort_worktrees(&mut worktrees);
+    worktrees
+}
+
+pub fn matching_indexes(worktrees: &[Worktree], query: &Query, now: i64) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..worktrees.len()).collect();
+    }
+    let matched = matching_repos(worktrees, query, now);
+    worktrees
+        .iter()
+        .enumerate()
+        .filter(|(_, wt)| {
+            if wt.deletable() {
+                deletable_matches(wt, query, now)
+            } else {
+                matched.contains(&wt.git_common_dir)
+            }
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn matching_repos(worktrees: &[Worktree], query: &Query, now: i64) -> HashSet<PathBuf> {
+    worktrees
+        .iter()
+        .filter(|wt| deletable_matches(wt, query, now))
+        .map(|wt| wt.git_common_dir.clone())
+        .collect()
+}
+
+pub fn deletable_matches(wt: &Worktree, query: &Query, now: i64) -> bool {
+    if !wt.deletable() {
+        return false;
+    }
+    if query.merged_only && wt.merged != Some(true) {
+        return false;
+    }
+    if let Some(min_age) = query.inactive_for {
+        if !is_inactive(wt, now, min_age) {
+            return false;
+        }
+    }
+    if let Some(min_age) = query.created_before {
+        match wt.created_at {
+            Some(ts) if now.saturating_sub(ts) >= min_age => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_inactive(wt: &Worktree, now: i64, min_age: i64) -> bool {
+    match wt.last_active {
+        Some(ts) => now.saturating_sub(ts) >= min_age,
+        None => true,
+    }
+}
+
+fn sort_worktrees(worktrees: &mut [Worktree]) {
     worktrees.sort_by(|a, b| {
         b.deletable()
             .cmp(&a.deletable())
@@ -149,14 +239,6 @@ pub fn apply_view(
             .then_with(|| a.repo.cmp(&b.repo))
             .then_with(|| a.path.cmp(&b.path))
     });
-    worktrees
-}
-
-fn is_old(wt: &Worktree, now: i64, min_age: i64) -> bool {
-    match wt.last_active {
-        Some(ts) => now.saturating_sub(ts) >= min_age,
-        None => true,
-    }
 }
 
 fn activity_ord(a: Option<i64>, b: Option<i64>) -> std::cmp::Ordering {
@@ -173,7 +255,7 @@ pub fn scan(roots: &[PathBuf], max_depth: u8) -> ScanResult {
     let mut commons = BTreeSet::new();
     for root in roots {
         if !root.exists() {
-            errors.push(format!("不存在: {}", root.display()));
+            errors.push(format!("missing: {}", root.display()));
             continue;
         }
         discover(root, max_depth, &mut commons);
@@ -190,9 +272,15 @@ pub fn scan(roots: &[PathBuf], max_depth: u8) -> ScanResult {
         }
     }
 
-    let worktrees: Vec<Worktree> = jobs.into_par_iter().map(enrich).collect();
+    let mut worktrees: Vec<Worktree> = jobs.into_par_iter().map(enrich).collect();
+    sort_worktrees(&mut worktrees);
+    let repos = worktrees
+        .iter()
+        .map(|wt| &wt.git_common_dir)
+        .collect::<HashSet<_>>()
+        .len();
     ScanResult {
-        repos: 0,
+        repos,
         worktrees,
         errors,
     }
@@ -263,6 +351,7 @@ fn inspect(common: &Path) -> Result<Vec<Job>, String> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
     let git_common_dir = common.to_path_buf();
+    let base = default_base(&repo_root);
     Ok(records
         .into_iter()
         .map(|raw| {
@@ -273,6 +362,7 @@ fn inspect(common: &Path) -> Result<Vec<Job>, String> {
                 repo_root: repo_root.clone(),
                 git_common_dir: git_common_dir.clone(),
                 main,
+                base: base.clone(),
             }
         })
         .collect())
@@ -299,6 +389,14 @@ fn enrich(job: Job) -> Worktree {
             .max();
         (dirty, last_commit, last_active)
     };
+    let merged = if job.main || job.raw.bare || job.raw.head.is_empty() {
+        None
+    } else if let Some(base) = &job.base {
+        is_ancestor(&job.repo_root, &job.raw.head, base)
+    } else {
+        None
+    };
+    let created_at = if missing { None } else { created_unix(&path) };
     Worktree {
         path,
         parent,
@@ -313,10 +411,69 @@ fn enrich(job: Job) -> Worktree {
         prunable: job.raw.prunable,
         missing,
         dirty,
+        merged,
         last_commit,
         last_active,
         last_active_utc: last_active.map(format_utc),
+        created_at,
+        created_utc: created_at.map(format_utc),
     }
+}
+
+fn default_base(repo: &Path) -> Option<String> {
+    if let Ok(remote) = git_output_in(
+        repo,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        let remote = remote.trim();
+        let local = remote.rsplit('/').next().unwrap_or(remote);
+        if rev_exists(repo, &format!("refs/heads/{local}")) {
+            return Some(local.to_string());
+        }
+        if rev_exists(repo, remote) {
+            return Some(remote.to_string());
+        }
+    }
+    for candidate in ["main", "master", "trunk"] {
+        if rev_exists(repo, &format!("refs/heads/{candidate}")) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn rev_exists(repo: &Path, rev: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", rev])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn is_ancestor(repo: &Path, head: &str, base: &str) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", head, base])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+fn created_unix(path: &Path) -> Option<i64> {
+    let created = fs::metadata(path).ok()?.created().ok()?;
+    created
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|dur| dur.as_secs() as i64)
 }
 
 fn branch_label(raw: &RawWt) -> String {
@@ -460,11 +617,13 @@ fn git_output_in(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn finish_git(mut cmd: Command, args: &[&str]) -> Result<String, String> {
-    let out = cmd.output().map_err(|err| format!("无法运行 git: {err}"))?;
+    let out = cmd
+        .output()
+        .map_err(|err| format!("cannot run git: {err}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if err.is_empty() {
-            format!("git {} 失败", args.join(" "))
+            format!("git {} failed", args.join(" "))
         } else {
             err
         });
@@ -507,9 +666,12 @@ pub fn fixture(path: &str, repo: &str, main: bool, last_active: Option<i64>) -> 
         prunable: false,
         missing: false,
         dirty: Some(false),
+        merged: None,
         last_commit: last_active,
         last_active,
         last_active_utc: last_active.map(format_utc),
+        created_at: None,
+        created_utc: None,
     }
 }
 
@@ -561,13 +723,59 @@ prunable gitdir file points to non-existent location
         let fresh_main = fixture("/repos/new", "new", true, Some(now - 10));
         let viewed = apply_view(
             vec![fresh, old_main, fresh_main, old],
-            Some(86_400 * 10),
+            &Query {
+                inactive_for: Some(86_400 * 10),
+                ..Query::default()
+            },
             now,
         );
         let repos: HashSet<_> = viewed.iter().map(|wt| wt.repo.as_str()).collect();
         assert_eq!(repos, HashSet::from(["old"]));
         assert!(viewed.iter().any(|wt| wt.main));
         assert!(viewed.iter().any(|wt| wt.deletable()));
+    }
+
+    #[test]
+    fn created_and_idle_keeps_only_both() {
+        let now = 1_000_000;
+        let mut old_idle = fixture(
+            "/repos/demo/.worktrees/old",
+            "demo",
+            false,
+            Some(now - 86_400 * 10),
+        );
+        old_idle.created_at = Some(now - 86_400 * 40);
+        let mut old_fresh = fixture(
+            "/repos/demo/.worktrees/fresh",
+            "demo",
+            false,
+            Some(now - 86_400),
+        );
+        old_fresh.created_at = Some(now - 86_400 * 40);
+        let mut young_idle = fixture(
+            "/repos/demo/.worktrees/young",
+            "demo",
+            false,
+            Some(now - 86_400 * 10),
+        );
+        young_idle.created_at = Some(now - 86_400 * 2);
+        let main = fixture("/repos/demo", "demo", true, Some(now));
+        let viewed = apply_view(
+            vec![old_fresh, young_idle, main, old_idle],
+            &Query {
+                inactive_for: Some(86_400 * 7),
+                created_before: Some(86_400 * 30),
+                merged_only: false,
+            },
+            now,
+        );
+        let paths: Vec<_> = viewed
+            .iter()
+            .filter(|wt| wt.deletable())
+            .map(|wt| wt.path.display().to_string())
+            .collect();
+        assert_eq!(paths, vec!["/repos/demo/.worktrees/old".to_string()]);
+        assert!(viewed.iter().any(|wt| wt.main));
     }
 
     #[test]
@@ -596,7 +804,7 @@ prunable gitdir file points to non-existent location
             &["worktree", "add", "-b", "feature", linked.to_str().unwrap()]
         ));
 
-        let result = load(std::slice::from_ref(&root), 4, None);
+        let result = load(std::slice::from_ref(&root), 4, &Query::default());
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         assert_eq!(result.repos, 1);
         assert_eq!(result.worktrees.len(), 2);
@@ -609,14 +817,35 @@ prunable gitdir file points to non-existent location
         assert_eq!(extra.repo, "demo");
         assert_eq!(extra.dirty, Some(false));
         assert!(extra.last_active.is_some());
+        assert!(extra.created_at.is_some());
+        assert_eq!(extra.merged, Some(true), "a branch at main is merged");
         assert!(result.worktrees.iter().any(|wt| wt.main && !wt.deletable()));
 
+        fs::write(linked.join("note.txt"), "change\n").unwrap();
+        assert!(git_in(&linked, &["add", "note.txt"]));
+        assert!(git_in(&linked, &["commit", "-m", "feature"]));
+        let unmerged = load(std::slice::from_ref(&root), 4, &Query::default());
+        let feature = unmerged
+            .worktrees
+            .iter()
+            .find(|wt| wt.branch == "feature")
+            .unwrap();
+        assert_eq!(feature.merged, Some(false));
+        assert!(git_in(&repo, &["merge", "--ff-only", "feature"]));
+        let merged = load(std::slice::from_ref(&root), 4, &Query::default());
+        let feature = merged
+            .worktrees
+            .iter()
+            .find(|wt| wt.branch == "feature")
+            .unwrap();
+        assert_eq!(feature.merged, Some(true));
+
         fs::write(linked.join("extra.txt"), "x\n").unwrap();
-        let again = load(std::slice::from_ref(&root), 4, None);
+        let again = load(std::slice::from_ref(&root), 4, &Query::default());
         let dirty = again.worktrees.iter().find(|wt| wt.deletable()).unwrap();
         assert_eq!(dirty.dirty, Some(true));
         let refused = crate::remove::delete_one(dirty, false).unwrap_err();
-        assert!(refused.contains("干净"), "{refused}");
+        assert!(refused.contains("clean"), "{refused}");
         crate::remove::delete_one(dirty, true).unwrap();
         assert!(!linked.exists());
     }

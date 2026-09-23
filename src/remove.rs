@@ -1,6 +1,20 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::scan::Worktree;
+
+const DEP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    ".next",
+    ".turbo",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "Pods",
+    ".gradle",
+];
 
 pub struct DeleteOutcome {
     pub path: std::path::PathBuf,
@@ -27,14 +41,14 @@ pub fn delete_many(
 
 pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
     if wt.main || wt.bare || wt.path == wt.repo_root {
-        return Err("不会删除主检出".to_string());
+        return Err("refusing to delete the main checkout".to_string());
     }
     if !force {
         if wt.locked {
-            return Err("已锁定，按 f 强制删除".to_string());
+            return Err("locked; press f to force".to_string());
         }
         if !wt.missing && wt.dirty != Some(false) {
-            return Err("不是干净工作区，按 f 强制删除".to_string());
+            return Err("not a clean worktree; press f to force".to_string());
         }
     }
 
@@ -50,16 +64,95 @@ pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
         cmd.args(["--force", "--force"]);
     }
     cmd.arg(&wt.path);
-    let out = cmd.output().map_err(|err| format!("无法运行 git: {err}"))?;
+    let out = cmd
+        .output()
+        .map_err(|err| format!("cannot run git: {err}"))?;
     if out.status.success() {
         return Ok(());
     }
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     Err(if err.is_empty() {
-        "git worktree remove 失败".to_string()
+        "git worktree remove failed".to_string()
     } else {
         err
     })
+}
+
+pub struct CleanOutcome {
+    pub removed: Vec<PathBuf>,
+    pub errors: Vec<String>,
+}
+
+pub fn clean_many(items: &[Worktree], paths: &[PathBuf]) -> CleanOutcome {
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    for path in paths {
+        let Some(wt) = items.iter().find(|wt| &wt.path == path) else {
+            continue;
+        };
+        if !wt.deletable() || wt.missing {
+            errors.push(format!(
+                "{}: skipped main checkout or missing directory",
+                path.display()
+            ));
+            continue;
+        }
+        match clean_deps(&wt.path) {
+            Ok(found) => removed.extend(found),
+            Err(err) => errors.push(err),
+        }
+    }
+    CleanOutcome { removed, errors }
+}
+
+pub fn clean_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
+    if !root.is_dir() {
+        return Err(format!("directory does not exist: {}", root.display()));
+    }
+    let mut removed = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                return Err(format!("{}：{err}", dir.display()));
+            }
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == ".git" {
+                continue;
+            }
+            if DEP_DIRS.contains(&name.as_ref()) {
+                let path = entry.path();
+                fs::remove_dir_all(&path).map_err(|err| format!("{}：{err}", path.display()))?;
+                removed.push(path);
+            } else {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(removed)
+}
+
+pub fn summarize_clean(outcome: &CleanOutcome) -> String {
+    if outcome.errors.is_empty() {
+        format!("cleaned {} dependency directories", outcome.removed.len())
+    } else {
+        format!(
+            "cleaned {} dependency directories, {} failed: {}",
+            outcome.removed.len(),
+            outcome.errors.len(),
+            outcome.errors[0]
+        )
+    }
 }
 
 pub fn summarize(outcomes: &[DeleteOutcome]) -> String {
@@ -69,11 +162,11 @@ pub fn summarize(outcomes: &[DeleteOutcome]) -> String {
         .filter(|item| item.error.is_some())
         .collect();
     if failed.is_empty() {
-        format!("已删除 {ok} 个 worktree")
+        format!("deleted {ok} worktrees")
     } else {
         let first = failed[0].error.as_deref().unwrap_or("");
         format!(
-            "已删除 {ok} 个，失败 {} 个：{}（{first}）",
+            "deleted {ok}, {} failed: {} ({first})",
             failed.len(),
             failed[0].path.display()
         )
@@ -86,9 +179,35 @@ mod tests {
     use crate::scan::fixture;
 
     #[test]
+    fn removes_dependency_dirs_and_keeps_source() {
+        let root = std::env::temp_dir().join(format!("wtrm-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.js"), "ok\n").unwrap();
+        fs::create_dir_all(root.join("node_modules/left")).unwrap();
+        fs::write(root.join("node_modules/left/index.js"), "x\n").unwrap();
+        fs::create_dir_all(root.join("apps/web/node_modules/pkg")).unwrap();
+        fs::write(root.join("apps/web/node_modules/pkg/a.js"), "x\n").unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::write(root.join("keep-target.txt"), "no\n").unwrap();
+
+        let removed = clean_deps(&root).unwrap();
+        assert_eq!(removed.len(), 3);
+        assert!(!root.join("node_modules").exists());
+        assert!(!root.join("apps/web/node_modules").exists());
+        assert!(!root.join("target").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.js")).unwrap(),
+            "ok\n"
+        );
+        assert!(root.join("apps/web").is_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn refuses_main_checkout() {
         let wt = fixture("/repos/demo", "demo", true, Some(10));
         let err = delete_one(&wt, true).unwrap_err();
-        assert!(err.contains("主检出"));
+        assert!(err.contains("main checkout"));
     }
 }
