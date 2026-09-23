@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# Local planning artifacts
+/.planning/
+
+# Local Git worktrees
+/.worktrees/
