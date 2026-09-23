@@ -1,6 +1,6 @@
 [package]
 name = "wtrm"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Scan git worktrees on this machine and delete the ones you pick"
 readme = "README.md"
