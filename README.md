@@ -26,7 +26,7 @@ wtrm
 
 活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。只列出有附加 worktree 的仓库。主检出会显示，但不能删除。
 
-删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。Enter 删除干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。
+删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。Enter 删除干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。确认删除时按 `b` 切换是否连分支一起删：保留、只删本地，或连 GitHub 远程一起删。别的检出还在用的分支会留下。
 
 常用筛选：
 
@@ -58,6 +58,7 @@ wtrm --all
 | `x` | 只清理选中 worktree 里的依赖目录 |
 | `Enter` | 删除时只删干净的；清理依赖时直接确认 |
 | `f` | 强制删除，包括脏和锁定的 |
+| `b` | 确认删除时切换分支：保留、只删本地、或连 GitHub 远程一起删 |
 | `/` | 按文字过滤 |
 | `r` | 重新扫描 |
 | `q` | 退出 |
