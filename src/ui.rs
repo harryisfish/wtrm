@@ -29,7 +29,10 @@ pub enum Action {
     None,
     Quit,
     Rescan,
-    Delete { force: bool },
+    Delete {
+        force: bool,
+        branches: remove::BranchScope,
+    },
     CleanDeps,
 }
 
@@ -56,6 +59,7 @@ pub struct App {
     pub inactive_secs: i64,
     pub stale_created_secs: i64,
     pub stale_idle_secs: i64,
+    pub branch_scope: remove::BranchScope,
 }
 
 impl App {
@@ -77,6 +81,7 @@ impl App {
             inactive_secs: 14 * 86_400,
             stale_created_secs: 30 * 86_400,
             stale_idle_secs: 7 * 86_400,
+            branch_scope: remove::BranchScope::Keep,
         };
         app.apply_scan(result);
         app.status = if let Some(err) = errors.first() {
@@ -162,13 +167,23 @@ impl App {
                 self.pending = Pending::None;
                 match pending {
                     Pending::Clean => Action::CleanDeps,
-                    Pending::Delete => Action::Delete { force: false },
+                    Pending::Delete => Action::Delete {
+                        force: false,
+                        branches: self.branch_scope,
+                    },
                     Pending::None => Action::None,
                 }
             }
             KeyCode::Char('f') | KeyCode::Char('F') if self.pending == Pending::Delete => {
                 self.pending = Pending::None;
-                Action::Delete { force: true }
+                Action::Delete {
+                    force: true,
+                    branches: self.branch_scope,
+                }
+            }
+            KeyCode::Char('b') if self.pending == Pending::Delete => {
+                self.branch_scope = self.branch_scope.next();
+                Action::None
             }
             KeyCode::Esc => {
                 self.pending = Pending::None;
@@ -312,6 +327,7 @@ impl App {
             return;
         }
         self.pending = Pending::Delete;
+        self.branch_scope = remove::BranchScope::Keep;
     }
 
     fn arm_clean(&mut self) {
@@ -405,11 +421,12 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
                 app.apply_scan(result);
                 app.status = format!("refreshed, {} worktrees", app.items.len());
             }
-            Action::Delete { force } => {
+            Action::Delete { force, branches } => {
                 let paths: Vec<_> = app.selected.iter().cloned().collect();
                 app.status = "deleting…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
-                let message = remove::summarize(&remove::delete_many(&app.items, &paths, force));
+                let message =
+                    remove::summarize(&remove::delete_many(&app.items, &paths, force, branches));
                 let result = scan::scan(&opts.roots, opts.max_depth);
                 app.apply_scan(result);
                 app.status = message;
@@ -577,7 +594,7 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
         )),
         Line::from(format!("{filter}{}", app.status)),
         Line::from("m merged   i idle   s old+idle   0 all   x clean deps"),
-        Line::from("j/k move   space select   a all   d delete   / filter   r refresh   q quit"),
+        Line::from("j/k move   space select   a all   d delete   b branch   / filter   r refresh   q quit"),
     ]
 }
 
@@ -616,8 +633,9 @@ fn selected_worktrees(app: &App) -> Vec<&Worktree> {
 fn confirm_lines(app: &App) -> Vec<Line<'static>> {
     let chosen = selected_worktrees(app);
     let mut lines = vec![Line::from(format!(
-        "delete {} worktrees. Enter deletes clean ones, f forces dirty or locked, Esc cancels.",
-        chosen.len()
+        "delete {} worktrees. branches: {}. Enter clean, f force, b cycle branches, Esc cancel.",
+        chosen.len(),
+        app.branch_scope.label()
     ))];
     for wt in chosen.iter().take(6) {
         lines.push(Line::from(format!(
@@ -664,7 +682,20 @@ mod tests {
         assert_eq!(app.pending, Pending::Delete);
         assert_eq!(
             app.on_key(KeyCode::Enter, KeyModifiers::NONE),
-            Action::Delete { force: false }
+            Action::Delete {
+                force: false,
+                branches: remove::BranchScope::Keep,
+            }
+        );
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            Action::Delete {
+                force: false,
+                branches: remove::BranchScope::GitHub,
+            }
         );
     }
 
@@ -733,7 +764,10 @@ mod tests {
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
         assert_eq!(
             app.on_key(KeyCode::Char('f'), KeyModifiers::NONE),
-            Action::Delete { force: true }
+            Action::Delete {
+                force: true,
+                branches: remove::BranchScope::Keep,
+            }
         );
     }
 }
