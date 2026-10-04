@@ -26,7 +26,7 @@ wtrm
 
 活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。只列出有附加 worktree 的仓库。主检出会显示，但不能删除。
 
-删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。Enter 删除干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。确认删除时按 `b` 切换是否连分支一起删：保留、只删本地，或连 GitHub 远程一起删。别的检出还在用的分支会留下。
+删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。确认删除时输入 `y` 或 `delete` 才删干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。`b` 切换分支策略：保留、只删本地，或连 GitHub 远程一起删。别的检出还在用的分支会留下。Enter 不会执行删除。
 
 常用筛选：
 
@@ -41,27 +41,61 @@ wtrm --all
 
 `--older-than` 是 `--inactive` 的别名。时长用 `s`、`m`、`h`、`d`、`w`。几个条件同时给出时是「并且」。已合并看默认分支的祖先：优先本地分支，本地没有时用对应的远程跟踪引用。不联网，也认不出 squash merge。
 
-非交互输出在 `--list`、`--json`，或标准输出不是终端时使用。
+非交互输出在 `--list`、`--json`、子命令，或标准输出不是终端时使用。`--json` 输出稳定对象，错误放在 `errors` 里，不需要再解析 stderr。
+
+## Agent / 脚本使用
+
+优先走查询 → 计划 → 显式执行。不要模拟 TUI 按键。默认 dry-run，显式 `--yes` 才改磁盘。用 JSON 里的稳定 `id` 定位，避免路径截断和 shell 转义。
+
+```bash
+wtrm --json ~/project
+wtrm plan --merged --json ~/project
+wtrm delete --id <id> --dry-run --json
+wtrm delete --id <id> --yes --json
+wtrm delete --path /abs/worktree --yes --json
+wtrm clean --path /abs/worktree --dry-run --json
+wtrm clean --id <id> --yes --json
+```
+
+JSON 顶层固定为：
+
+```json
+{
+  "schema_version": 1,
+  "roots": ["~/project"],
+  "scanned_repos": 12,
+  "worktrees": [],
+  "items": [],
+  "errors": [],
+  "complete": true
+}
+```
+
+`worktrees` 仍是扫描结果，每项带 `id`。`plan` / `delete` / `clean` 的 `items` 固定包含 `action`、`id`、`path`、`reason`、`blocked_by`、`result`。`result` 为 `dry-run`、`ok`、`blocked` 或 `failed`。主检出、脏工作区、锁定会标 `blocked_by`。扫描完成但没有匹配时：`complete` 为 true、`worktrees` / `items` 为空。部分根读失败时错误在 `errors` 里，`complete` 仍为 true。
+
+`--list` 表格第一列是短 id（8 位）。完整 16 位 id 在 JSON 和 TUI 详情行。`delete` / `clean` 必须带 `--path` 或 `--id`。
 
 ## 交互
 
 | 键 | 作用 |
 | --- | --- |
 | `j` / `k` | 移动 |
-| `space` | 多选 |
-| `m` | 筛出已合并的，并选中 |
-| `i` | 筛出不活跃的（默认 14 天），并选中 |
-| `s` | 筛出创建超过 30 天、且最近 7 天没动的，并选中 |
-| `0` | 取消筛选 |
-| `a` | 选中或取消当前列表里全部可删除项 |
+| `space` | 多选；状态栏显示 `selection changed` |
+| `m` | 只筛出已合并的，不改选择 |
+| `i` | 只筛出不活跃的（默认 14 天），不改选择 |
+| `s` | 只筛出创建超过 30 天、且最近 7 天没动的，不改选择 |
+| `0` | 取消筛选，不改选择 |
+| `a` | 切换当前可见列表里全部可删除项（不是无条件全选） |
 | `d` | 确认删除 worktree |
 | `x` | 只清理选中 worktree 里的依赖目录 |
-| `Enter` | 删除时只删干净的；清理依赖时直接确认 |
+| `y` 或输入 `delete` | 删除干净的 worktree；清理依赖时确认 |
 | `f` | 强制删除，包括脏和锁定的 |
-| `b` | 确认删除时切换分支：保留、只删本地、或连 GitHub 远程一起删 |
-| `/` | 按文字过滤 |
-| `r` | 重新扫描 |
+| `b` | 确认删除时切换分支策略：保留、只删本地、或连 GitHub 远程一起删 |
+| `/` | 按文字过滤；Enter 应用，Esc 清空 |
+| `r` | 重新扫描；失效的选择会提示 `selection pruned: N` |
 | `q` | 退出 |
+
+状态列用 `[main]`、`[dirty]`、`[clean]`、`[locked]`、`[merged]` 标记，颜色只做辅助。窄终端隐藏 folder 和 path，完整路径在选中行详情里。
 
 启动时如果同时给了 `--created-before` 和 `--inactive`，`s` 改用这两个时长。只给 `--inactive` 时，它改的是 `i`，`s` 仍是创建 30 天、空闲 7 天。只给 `--created-before` 时，`s` 的创建时长改用它，空闲仍是 7 天。
 
