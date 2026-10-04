@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use ratatui::Frame;
 
 use crate::ops;
 use crate::remove;
+use crate::report::ActionItem;
 use crate::scan::{self, Query, ScanResult, Worktree};
 use crate::timeutil::{self, age_label};
 
@@ -81,6 +82,8 @@ pub struct App {
     pub confirm_buf: String,
     pub note: String,
     pub op: OperationStatus,
+    pub last_result: Vec<ActionItem>,
+    pub confirm_hint: String,
     pub now: i64,
     pub query: Query,
     pub inactive_secs: i64,
@@ -105,6 +108,8 @@ impl App {
             confirm_buf: String::new(),
             note: String::new(),
             op: OperationStatus::Idle,
+            last_result: Vec::new(),
+            confirm_hint: String::new(),
             now: timeutil::now_unix(),
             query: Query::default(),
             inactive_secs: 14 * 86_400,
@@ -136,6 +141,42 @@ impl App {
         self.now = timeutil::now_unix();
         self.clamp_cursor();
         before.saturating_sub(self.selected.len())
+    }
+
+    pub fn apply_mutate_result(&mut self, items: Vec<ActionItem>) {
+        let gone: HashSet<PathBuf> = items
+            .iter()
+            .filter(|item| item.result == "ok")
+            .map(|item| item.path.clone())
+            .collect();
+        self.items.retain(|wt| !gone.contains(&wt.path));
+        let linked: HashSet<_> = self
+            .items
+            .iter()
+            .filter(|wt| wt.deletable())
+            .map(|wt| wt.git_common_dir.clone())
+            .collect();
+        self.items
+            .retain(|wt| wt.deletable() || linked.contains(&wt.git_common_dir));
+        self.selected.retain(|path| {
+            self.items
+                .iter()
+                .any(|wt| &wt.path == path && wt.deletable())
+        });
+        self.repos = self
+            .items
+            .iter()
+            .map(|wt| &wt.git_common_dir)
+            .collect::<HashSet<_>>()
+            .len();
+        let (succeeded, failed) = ops::counts(&items);
+        self.op = OperationStatus::Finished { succeeded, failed };
+        self.note = ops::summarize_items(&items);
+        self.last_result = items;
+        self.pending = Pending::None;
+        self.confirm_buf.clear();
+        self.confirm_hint.clear();
+        self.clamp_cursor();
     }
 
     pub fn status_text(&self) -> String {
@@ -241,6 +282,8 @@ impl App {
                 if self.confirm_buf.eq_ignore_ascii_case("delete") {
                     self.confirm_pending(false)
                 } else {
+                    self.confirm_hint =
+                        "Enter does not delete. press y or type delete.".to_string();
                     Action::None
                 }
             }
@@ -256,7 +299,14 @@ impl App {
                 }
                 Action::None
             }
-            KeyCode::Enter => Action::None,
+            KeyCode::Enter => {
+                self.confirm_hint = if self.pending == Pending::Clean {
+                    "Enter does not clean. press y.".to_string()
+                } else {
+                    "Enter does not delete. press y or type delete.".to_string()
+                };
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -413,6 +463,7 @@ impl App {
         }
         self.pending = Pending::Delete;
         self.confirm_buf.clear();
+        self.confirm_hint.clear();
         self.branch_scope = remove::BranchScope::Keep;
     }
 
@@ -426,6 +477,7 @@ impl App {
         }
         self.pending = Pending::Clean;
         self.confirm_buf.clear();
+        self.confirm_hint.clear();
     }
 
     fn apply_preset(&mut self, query: Query) {
@@ -523,36 +575,53 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
             }
             Action::Delete { force, branches } => {
                 let paths: Vec<_> = app.selected.iter().cloned().collect();
-                app.op = OperationStatus::Running {
-                    action: ActionKind::Delete,
-                    total: paths.len(),
-                };
-                app.note = "deleting…".to_string();
-                terminal.draw(|frame| draw(frame, &app))?;
-                let items = ops::delete_targets(&app.items, &paths, &[], true, force, branches);
-                let (succeeded, failed) = ops::counts(&items);
-                app.op = OperationStatus::Finished { succeeded, failed };
-                app.note = ops::summarize_items(&items);
-                let result = scan::scan(&opts.roots, opts.max_depth);
-                let pruned = app.apply_scan(result);
-                if pruned > 0 {
-                    app.note = format!("{}. selection pruned: {pruned}", app.note);
+                let mut all = Vec::new();
+                for (i, path) in paths.iter().enumerate() {
+                    app.op = OperationStatus::Running {
+                        action: ActionKind::Delete,
+                        total: paths.len(),
+                    };
+                    app.note = format!(
+                        "deleting {}/{}  {}",
+                        i + 1,
+                        paths.len(),
+                        scan::shorten_path(path)
+                    );
+                    terminal.draw(|frame| draw(frame, &app))?;
+                    all.extend(ops::delete_targets(
+                        &app.items,
+                        std::slice::from_ref(path),
+                        &[],
+                        true,
+                        force,
+                        branches,
+                    ));
                 }
+                app.apply_mutate_result(all);
             }
             Action::CleanDeps => {
                 let paths: Vec<_> = app.selected.iter().cloned().collect();
-                app.op = OperationStatus::Running {
-                    action: ActionKind::Clean,
-                    total: paths.len(),
-                };
-                app.note = "cleaning dependencies…".to_string();
-                terminal.draw(|frame| draw(frame, &app))?;
-                let items = ops::clean_targets(&app.items, &paths, &[], true);
-                let (succeeded, failed) = ops::counts(&items);
-                app.op = OperationStatus::Finished { succeeded, failed };
-                app.note = ops::summarize_items(&items);
-                let result = scan::scan(&opts.roots, opts.max_depth);
-                app.apply_scan(result);
+                let mut all = Vec::new();
+                for (i, path) in paths.iter().enumerate() {
+                    app.op = OperationStatus::Running {
+                        action: ActionKind::Clean,
+                        total: paths.len(),
+                    };
+                    app.note = format!(
+                        "cleaning {}/{}  {}",
+                        i + 1,
+                        paths.len(),
+                        scan::shorten_path(path)
+                    );
+                    terminal.draw(|frame| draw(frame, &app))?;
+                    all.extend(ops::clean_targets(
+                        &app.items,
+                        std::slice::from_ref(path),
+                        &[],
+                        true,
+                    ));
+                }
+                app.apply_mutate_result(all);
             }
         }
     }
@@ -568,9 +637,14 @@ impl Drop for Restore {
 }
 
 fn draw(frame: &mut Frame, app: &App) {
+    let extra = if app.last_result.is_empty() {
+        0
+    } else {
+        (app.last_result.len().min(4) as u16).saturating_add(1)
+    };
     let foot_h = match app.pending {
-        Pending::None if app.filter_mode => 7,
-        Pending::None => 9,
+        Pending::None if app.filter_mode => 7 + extra,
+        Pending::None => 9 + extra,
         _ => 14,
     };
     let chunks =
@@ -708,6 +782,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Pending::Delete => " confirm delete ",
         Pending::Clean => " confirm clean ",
         Pending::None if app.filter_mode => " filter ",
+        Pending::None if !app.last_result.is_empty() => " result ",
         Pending::None => " help ",
     };
     let paragraph = Paragraph::new(lines)
@@ -749,7 +824,7 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
         }
         None => "no repos with linked worktrees".to_string(),
     };
-    vec![
+    let mut lines = vec![
         Line::from(detail),
         Line::from(Span::styled(
             format!(
@@ -759,9 +834,29 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
             Style::new().fg(Color::DarkGray),
         )),
         Line::from(app.status_text()),
-        Line::from("m merged   i idle   s old+idle   0 all   x clean deps"),
-        Line::from("j/k move   space select   a toggle visible   d delete   / filter   r refresh   q quit"),
-    ]
+    ];
+    lines.extend(result_lines(app));
+    lines.push(Line::from(
+        "m merged   i idle   s old+idle   0 all   x clean deps",
+    ));
+    lines.push(Line::from(
+        "j/k move   space select   a toggle visible   d delete   / filter   r refresh   q quit",
+    ));
+    lines
+}
+
+fn result_lines(app: &App) -> Vec<Line<'static>> {
+    if app.last_result.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "last result:",
+        Style::new().add_modifier(Modifier::BOLD),
+    ))];
+    for text in ops::result_lines(&app.last_result, 4) {
+        lines.push(Line::from(text));
+    }
+    lines
 }
 
 fn clean_lines(app: &App) -> Vec<Line<'static>> {
@@ -776,6 +871,9 @@ fn clean_lines(app: &App) -> Vec<Line<'static>> {
         ),
         Line::from("y confirm    Esc cancel    Enter does nothing"),
     ];
+    if !app.confirm_hint.is_empty() {
+        lines.push(Line::from(app.confirm_hint.clone()));
+    }
     for wt in chosen.iter().take(6) {
         lines.push(Line::from(format!(
             "  {}  {}  {}",
@@ -812,6 +910,9 @@ fn confirm_lines(app: &App) -> Vec<Line<'static>> {
         Line::from("b branch policy: keep → local → GitHub"),
         Line::from(format!("{typed}    Esc cancel    Enter does nothing")),
     ];
+    if !app.confirm_hint.is_empty() {
+        lines.push(Line::from(app.confirm_hint.clone()));
+    }
     for wt in chosen.iter().take(5) {
         lines.push(Line::from(format!(
             "  {}  {}  {}  {}",
@@ -1038,5 +1139,66 @@ mod tests {
         let wide = column_spec(140);
         assert!(wide.show_folder);
         assert!(wide.show_path);
+    }
+
+    #[test]
+    fn enter_explains_it_does_not_delete() {
+        let mut app = app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(10)),
+            fixture("/repos/demo/.worktrees/feat", "demo", false, Some(10)),
+        ]);
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
+        assert!(app.confirm_hint.contains("Enter does not delete"));
+        assert_eq!(app.pending, Pending::Delete);
+    }
+
+    #[test]
+    fn mutate_result_drops_deleted_rows_and_keeps_feedback() {
+        let mut app = app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(10)),
+            fixture("/repos/demo/.worktrees/feat", "demo", false, Some(10)),
+        ]);
+        let feat = app.items[1].clone();
+        app.apply_mutate_result(vec![ActionItem::new("delete", &feat, "clean", None, "ok")]);
+        assert!(
+            app.items.is_empty(),
+            "main should drop when no linked trees remain: {:?}",
+            app.items
+                .iter()
+                .map(|wt| wt.path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(app.last_result.len(), 1);
+        assert!(app.note.contains("succeeded"));
+        assert_eq!(
+            app.op,
+            OperationStatus::Finished {
+                succeeded: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn blocked_result_keeps_rows_and_names_the_path() {
+        let mut app = app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(10)),
+            fixture("/repos/demo/.worktrees/feat", "demo", false, Some(10)),
+        ]);
+        let feat = app.items[1].clone();
+        app.apply_mutate_result(vec![ActionItem::new(
+            "delete",
+            &feat,
+            "dirty",
+            Some("dirty".to_string()),
+            "blocked",
+        )]);
+        assert_eq!(app.items.len(), 2);
+        assert!(app.note.contains("blocked"));
+        assert!(app.note.contains("dirty"));
+        assert_eq!(app.last_result[0].result, "blocked");
     }
 }
