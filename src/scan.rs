@@ -34,6 +34,7 @@ const SKIP_DIRS: &[&str] = &[
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Worktree {
+    pub id: String,
     pub path: PathBuf,
     pub parent: PathBuf,
     pub repo: String,
@@ -63,32 +64,55 @@ impl Worktree {
     pub fn flags(&self) -> String {
         let mut flags = Vec::new();
         if self.bare {
-            flags.push("bare");
+            flags.push("[bare]");
         } else if self.main {
-            flags.push("main");
+            flags.push("[main]");
         } else if self.missing {
-            flags.push("missing");
+            flags.push("[missing]");
         } else {
             match self.dirty {
-                Some(true) => flags.push("dirty"),
-                Some(false) => flags.push("clean"),
-                None => flags.push("unknown"),
+                Some(true) => flags.push("[dirty]"),
+                Some(false) => flags.push("[clean]"),
+                None => flags.push("[unknown]"),
             }
         }
         if self.locked {
-            flags.push("locked");
+            flags.push("[locked]");
         }
         if self.prunable {
-            flags.push("prunable");
+            flags.push("[prunable]");
         }
         if self.merged == Some(true) {
-            flags.push("merged");
+            flags.push("[merged]");
         }
         if flags.is_empty() {
-            flags.push("-");
+            flags.push("[-]");
         }
-        flags.join(",")
+        flags.join(" ")
     }
+
+    pub fn id_short(&self) -> &str {
+        let len = self.id.len().min(8);
+        &self.id[..len]
+    }
+}
+
+pub fn stable_id(repo: &str, branch: &str, path: &Path) -> String {
+    let path_s = path.to_string_lossy();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in repo
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(b"|".iter().copied())
+        .chain(branch.as_bytes().iter().copied())
+        .chain(b"|".iter().copied())
+        .chain(path_s.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -397,7 +421,9 @@ fn enrich(job: Job) -> Worktree {
         None
     };
     let created_at = if missing { None } else { created_unix(&path) };
+    let id = stable_id(&job.repo, &branch, &path);
     Worktree {
+        id,
         path,
         parent,
         repo: job.repo,
@@ -648,17 +674,20 @@ pub fn shorten_path(path: &Path) -> String {
 pub fn fixture(path: &str, repo: &str, main: bool, last_active: Option<i64>) -> Worktree {
     let path = PathBuf::from(path);
     let parent = path.parent().unwrap_or(Path::new("")).to_path_buf();
+    let branch = if main {
+        "main".to_string()
+    } else {
+        "feature".to_string()
+    };
+    let id = stable_id(repo, &branch, &path);
     Worktree {
+        id,
         path,
         parent,
         repo: repo.to_string(),
         repo_root: PathBuf::from(format!("/repos/{repo}")),
         git_common_dir: PathBuf::from(format!("/repos/{repo}/.git")),
-        branch: if main {
-            "main".to_string()
-        } else {
-            "feature".to_string()
-        },
+        branch,
         head: "abc".to_string(),
         main,
         bare: false,
@@ -678,6 +707,39 @@ pub fn fixture(path: &str, repo: &str, main: bool, last_active: Option<i64>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_id_is_deterministic_and_unique() {
+        let a = stable_id("demo", "feature", Path::new("/repos/demo/.worktrees/feat"));
+        let b = stable_id("demo", "feature", Path::new("/repos/demo/.worktrees/feat"));
+        let c = stable_id("demo", "other", Path::new("/repos/demo/.worktrees/feat"));
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, c);
+        let wt = fixture("/repos/demo/.worktrees/feat", "demo", false, Some(1));
+        assert_eq!(
+            wt.id,
+            stable_id("demo", "feature", Path::new("/repos/demo/.worktrees/feat"))
+        );
+        assert_eq!(wt.id_short().len(), 8);
+    }
+
+    #[test]
+    fn flags_use_bracket_markers() {
+        let main = fixture("/repos/demo", "demo", true, Some(1));
+        assert!(main.flags().contains("[main]"), "{}", main.flags());
+        let mut dirty = fixture("/repos/demo/.worktrees/feat", "demo", false, Some(1));
+        dirty.dirty = Some(true);
+        dirty.locked = true;
+        dirty.merged = Some(true);
+        let flags = dirty.flags();
+        assert!(flags.contains("[dirty]"), "{flags}");
+        assert!(flags.contains("[locked]"), "{flags}");
+        assert!(flags.contains("[merged]"), "{flags}");
+        let mut clean = fixture("/repos/demo/.worktrees/ok", "demo", false, Some(1));
+        clean.dirty = Some(false);
+        assert!(clean.flags().contains("[clean]"), "{}", clean.flags());
+    }
 
     #[test]
     fn parses_porcelain_records() {
@@ -815,6 +877,9 @@ prunable gitdir file points to non-existent location
             .expect("linked worktree");
         assert_eq!(extra.branch, "feature");
         assert_eq!(extra.repo, "demo");
+        assert!(!extra.id.is_empty());
+        assert!(extra.flags().contains("[clean]"));
+        assert!(extra.flags().contains("[merged]"));
         assert_eq!(extra.dirty, Some(false));
         assert!(extra.last_active.is_some());
         assert!(extra.created_at.is_some());

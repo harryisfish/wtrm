@@ -91,10 +91,10 @@ pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
     }
     if !force {
         if wt.locked {
-            return Err("locked; press f to force".to_string());
+            return Err("locked".to_string());
         }
         if !wt.missing && wt.dirty != Some(false) {
-            return Err("not a clean worktree; press f to force".to_string());
+            return Err("not a clean worktree".to_string());
         }
     }
 
@@ -124,38 +124,11 @@ pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
     })
 }
 
-pub struct CleanOutcome {
-    pub removed: Vec<PathBuf>,
-    pub errors: Vec<String>,
-}
-
-pub fn clean_many(items: &[Worktree], paths: &[PathBuf]) -> CleanOutcome {
-    let mut removed = Vec::new();
-    let mut errors = Vec::new();
-    for path in paths {
-        let Some(wt) = items.iter().find(|wt| &wt.path == path) else {
-            continue;
-        };
-        if !wt.deletable() || wt.missing {
-            errors.push(format!(
-                "{}: skipped main checkout or missing directory",
-                path.display()
-            ));
-            continue;
-        }
-        match clean_deps(&wt.path) {
-            Ok(found) => removed.extend(found),
-            Err(err) => errors.push(err),
-        }
-    }
-    CleanOutcome { removed, errors }
-}
-
-pub fn clean_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn find_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
     if !root.is_dir() {
         return Err(format!("directory does not exist: {}", root.display()));
     }
-    let mut removed = Vec::new();
+    let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
@@ -177,56 +150,23 @@ pub fn clean_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
                 continue;
             }
             if DEP_DIRS.contains(&name.as_ref()) {
-                let path = entry.path();
-                fs::remove_dir_all(&path).map_err(|err| format!("{}：{err}", path.display()))?;
-                removed.push(path);
+                found.push(entry.path());
             } else {
                 stack.push(entry.path());
             }
         }
     }
+    Ok(found)
+}
+
+pub fn clean_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let found = find_deps(root)?;
+    let mut removed = Vec::new();
+    for path in found {
+        fs::remove_dir_all(&path).map_err(|err| format!("{}：{err}", path.display()))?;
+        removed.push(path);
+    }
     Ok(removed)
-}
-
-pub fn summarize_clean(outcome: &CleanOutcome) -> String {
-    if outcome.errors.is_empty() {
-        format!("cleaned {} dependency directories", outcome.removed.len())
-    } else {
-        format!(
-            "cleaned {} dependency directories, {} failed: {}",
-            outcome.removed.len(),
-            outcome.errors.len(),
-            outcome.errors[0]
-        )
-    }
-}
-
-pub fn summarize(report: &DeleteReport) -> String {
-    let ok = report
-        .worktrees
-        .iter()
-        .filter(|item| item.error.is_none())
-        .count();
-    let failed: Vec<_> = report
-        .worktrees
-        .iter()
-        .filter(|item| item.error.is_some())
-        .collect();
-    let mut message = if failed.is_empty() {
-        format!("deleted {ok} worktrees")
-    } else {
-        let first = failed[0].error.as_deref().unwrap_or("");
-        format!(
-            "deleted {ok}, {} failed: {} ({first})",
-            failed.len(),
-            failed[0].path.display()
-        )
-    };
-    if !report.branch_notes.is_empty() {
-        message.push_str(". ");
-        message.push_str(&report.branch_notes.join("; "));
-    }
-    message
 }
 
 fn delete_branches(items: &[Worktree], removed: &[&Worktree], scope: BranchScope) -> Vec<String> {
@@ -453,6 +393,7 @@ gitlab\tgit@gitlab.com:acme/demo.git (push)
             "{:?}",
             report.worktrees[0].error
         );
+        assert_eq!(report.worktrees[0].path, feature.path);
         assert!(report
             .branch_notes
             .iter()

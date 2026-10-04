@@ -44,7 +44,19 @@ help=$("$WTRM" --help)
 [[ "$help" == *"Scan git worktrees"* ]] || fail "help missing about text"
 [[ "$help" == *"--merged"* ]] || fail "help missing --merged"
 [[ "$help" == *"--inactive"* ]] || fail "help missing --inactive"
+[[ "$help" == *"plan"* ]] || fail "help missing plan"
+[[ "$help" == *"delete"* ]] || fail "help missing delete"
 pass "help"
+
+plan_help=$("$WTRM" plan --help)
+[[ "$plan_help" == *"dry-run"* ]] || fail "plan help missing dry-run wording"
+pass "plan help"
+
+del_help=$("$WTRM" delete --help)
+[[ "$del_help" == *"--yes"* ]] || fail "delete help missing --yes"
+[[ "$del_help" == *"--path"* ]] || fail "delete help missing --path"
+[[ "$del_help" == *"--id"* ]] || fail "delete help missing --id"
+pass "delete help"
 
 if "$WTRM" --list --inactive not-a-duration "$ROOT" >/dev/null 2>"$ROOT/err"; then
   fail "invalid duration should fail"
@@ -74,14 +86,20 @@ echo "$list"
 echo "$list" | grep -q $'\tfeature\t' || fail "list missing feature"
 echo "$list" | grep -q $'\tmain\t' || fail "list missing main"
 echo "$list" | grep -q $'\tidle\t' || fail "list missing idle"
-echo "$list" | grep -q 'clean,merged' || fail "feature should be merged and clean"
+echo "$list" | grep -q '\[clean\] \[merged\]' || fail "feature should be merged and clean: $list"
 pass "list fixture"
 
 json=$("$WTRM" --json "$HOME_FAKE/project")
 python3 - "$json" <<'PY' || fail "json schema"
 import json, sys
 text = sys.argv[1]
-rows = json.loads(text)
+data = json.loads(text)
+assert data["schema_version"] == 1, data
+assert data["complete"] is True, data
+assert isinstance(data["roots"], list), data
+assert isinstance(data["errors"], list), data
+assert isinstance(data["items"], list), data
+rows = data["worktrees"]
 assert len(rows) == 3, rows
 by = {r["branch"]: r for r in rows}
 assert by["main"]["main"] is True
@@ -89,9 +107,58 @@ assert by["feature"]["main"] is False
 assert by["feature"]["merged"] is True
 assert by["feature"]["dirty"] is False
 assert by["idle"]["merged"] is False
+assert all("id" in r and r["id"] for r in rows), rows
 print("json rows ok", sorted(by))
 PY
 pass "json"
+
+plan=$("$WTRM" plan --json --merged "$HOME_FAKE/project")
+python3 - "$plan" <<'PY' || fail "plan json"
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["schema_version"] == 1
+items = data["items"]
+assert items, data
+assert all(i["action"] == "delete" for i in items), items
+assert all(k in items[0] for k in ("action", "path", "reason", "blocked_by", "result", "id"))
+feat = next(i for i in items if i["path"].endswith("demo-feature"))
+assert feat["result"] == "dry-run", feat
+assert feat["blocked_by"] is None, feat
+print("plan ok", feat["id"])
+PY
+pass "plan"
+
+FEATURE_ID=$(python3 - "$plan" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+print(next(i["id"] for i in data["items"] if i["path"].endswith("demo-feature")))
+PY
+)
+dry=$("$WTRM" delete --id "$FEATURE_ID" --dry-run --json "$HOME_FAKE/project")
+python3 - "$dry" <<'PY' || fail "delete dry-run"
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["items"][0]["result"] == "dry-run", data
+assert data["items"][0]["action"] == "delete"
+PY
+[[ -d "$LINKED" ]] || fail "dry-run deleted worktree"
+pass "delete dry-run"
+
+mkdir -p "$LINKED/node_modules/pkg"
+echo x >"$LINKED/node_modules/pkg/a.js"
+clean_dry=$("$WTRM" clean --path "$LINKED" --json "$HOME_FAKE/project")
+python3 - "$clean_dry" <<'PY' || fail "clean dry-run"
+import json, sys
+data = json.loads(sys.argv[1])
+item = data["items"][0]
+assert item["action"] == "clean", item
+assert item["result"] == "dry-run", item
+assert "node_modules" in item["reason"], item
+PY
+[[ -d "$LINKED/node_modules" ]] || fail "clean dry-run removed node_modules"
+"$WTRM" clean --path "$LINKED" --yes --json "$HOME_FAKE/project" >/dev/null
+[[ ! -d "$LINKED/node_modules" ]] || fail "clean --yes left node_modules"
+pass "clean"
 
 merged=$("$WTRM" --list --merged "$HOME_FAKE/project")
 echo "$merged" | grep -q $'\tfeature\t' || fail "merged filter dropped feature"
@@ -125,6 +192,11 @@ pass "default roots from HOME/project"
 HOME="$HOME_FAKE" "$WTRM" --list --all --max-depth 6 >"$ROOT/all.list"
 grep -q $'\tfeature\t' "$ROOT/all.list" || fail "--all missed fixture"
 pass "--all"
+
+echo "== mutate execute =="
+"$WTRM" delete --id "$FEATURE_ID" --yes --json "$HOME_FAKE/project" >/dev/null
+[[ ! -d "$LINKED" ]] || fail "delete --yes left worktree"
+pass "delete --yes"
 
 echo "== TUI quit =="
 python3 - "$WTRM" "$HOME_FAKE/project" <<'PY' || fail "TUI did not quit cleanly"

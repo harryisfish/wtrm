@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use crate::ops;
 use crate::remove;
 use crate::scan::{self, Query, ScanResult, Worktree};
 use crate::timeutil::{self, age_label};
@@ -37,6 +38,30 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationStatus {
+    Idle,
+    Running { action: ActionKind, total: usize },
+    Finished { succeeded: usize, failed: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Scan,
+    Delete,
+    Clean,
+}
+
+impl ActionKind {
+    fn label(self) -> &'static str {
+        match self {
+            ActionKind::Scan => "scan",
+            ActionKind::Delete => "delete",
+            ActionKind::Clean => "clean",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pending {
     None,
     Delete,
@@ -53,7 +78,9 @@ pub struct App {
     pub filter: String,
     pub filter_mode: bool,
     pub(crate) pending: Pending,
-    pub status: String,
+    pub confirm_buf: String,
+    pub note: String,
+    pub op: OperationStatus,
     pub now: i64,
     pub query: Query,
     pub inactive_secs: i64,
@@ -75,7 +102,9 @@ impl App {
             filter: String::new(),
             filter_mode: false,
             pending: Pending::None,
-            status: String::new(),
+            confirm_buf: String::new(),
+            note: String::new(),
+            op: OperationStatus::Idle,
             now: timeutil::now_unix(),
             query: Query::default(),
             inactive_secs: 14 * 86_400,
@@ -84,7 +113,7 @@ impl App {
             branch_scope: remove::BranchScope::Keep,
         };
         app.apply_scan(result);
-        app.status = if let Some(err) = errors.first() {
+        app.note = if let Some(err) = errors.first() {
             format!("{} read errors. {err}", errors.len())
         } else {
             format!("scanned {}", app.roots_label)
@@ -92,7 +121,8 @@ impl App {
         app
     }
 
-    pub fn apply_scan(&mut self, result: ScanResult) {
+    pub fn apply_scan(&mut self, result: ScanResult) -> usize {
+        let before = self.selected.len();
         self.repos = result.repos;
         self.errors = result.errors;
         self.items = result.worktrees;
@@ -102,8 +132,29 @@ impl App {
                 .any(|wt| &wt.path == path && wt.deletable())
         });
         self.pending = Pending::None;
+        self.confirm_buf.clear();
         self.now = timeutil::now_unix();
         self.clamp_cursor();
+        before.saturating_sub(self.selected.len())
+    }
+
+    pub fn status_text(&self) -> String {
+        let op = match self.op {
+            OperationStatus::Idle => None,
+            OperationStatus::Running { action, total } => {
+                Some(format!("{} {total}…", action.label()))
+            }
+            OperationStatus::Finished { succeeded, failed } => Some(if failed == 0 {
+                format!("finished: {succeeded} succeeded")
+            } else {
+                format!("finished: {succeeded} succeeded, {failed} failed")
+            }),
+        };
+        match (op, self.note.is_empty()) {
+            (Some(op), true) => op,
+            (Some(op), false) => format!("{op}. {}", self.note),
+            (None, _) => self.note.clone(),
+        }
     }
 
     pub fn visible(&self) -> Vec<usize> {
@@ -117,7 +168,8 @@ impl App {
                     return true;
                 }
                 let blob = format!(
-                    "{} {} {} {} {}",
+                    "{} {} {} {} {} {}",
+                    wt.id,
                     wt.repo,
                     wt.branch,
                     wt.path.display(),
@@ -149,8 +201,12 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.filter_mode = false;
+                self.note = format!("view changed: {} matches", self.visible().len());
             }
-            KeyCode::Enter => self.filter_mode = false,
+            KeyCode::Enter => {
+                self.filter_mode = false;
+                self.note = format!("view changed: {} matches", self.visible().len());
+            }
             KeyCode::Backspace => {
                 self.filter.pop();
             }
@@ -162,35 +218,60 @@ impl App {
 
     fn on_confirm_key(&mut self, code: KeyCode) -> Action {
         match code {
-            KeyCode::Enter => {
-                let pending = self.pending;
-                self.pending = Pending::None;
-                match pending {
-                    Pending::Clean => Action::CleanDeps,
-                    Pending::Delete => Action::Delete {
-                        force: false,
-                        branches: self.branch_scope,
-                    },
-                    Pending::None => Action::None,
-                }
-            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_pending(false),
             KeyCode::Char('f') | KeyCode::Char('F') if self.pending == Pending::Delete => {
-                self.pending = Pending::None;
-                Action::Delete {
-                    force: true,
-                    branches: self.branch_scope,
-                }
+                self.confirm_pending(true)
             }
             KeyCode::Char('b') if self.pending == Pending::Delete => {
                 self.branch_scope = self.branch_scope.next();
+                self.confirm_buf.clear();
                 Action::None
             }
             KeyCode::Esc => {
                 self.pending = Pending::None;
+                self.confirm_buf.clear();
                 Action::None
             }
             KeyCode::Char('q') => Action::Quit,
+            KeyCode::Backspace if self.pending == Pending::Delete => {
+                self.confirm_buf.pop();
+                Action::None
+            }
+            KeyCode::Enter if self.pending == Pending::Delete => {
+                if self.confirm_buf.eq_ignore_ascii_case("delete") {
+                    self.confirm_pending(false)
+                } else {
+                    Action::None
+                }
+            }
+            KeyCode::Char(ch) if self.pending == Pending::Delete => {
+                if ch.is_ascii_alphabetic() {
+                    self.confirm_buf.push(ch);
+                    if self.confirm_buf.eq_ignore_ascii_case("delete") {
+                        return self.confirm_pending(false);
+                    }
+                    if self.confirm_buf.len() > 6 {
+                        self.confirm_buf.clear();
+                    }
+                }
+                Action::None
+            }
+            KeyCode::Enter => Action::None,
             _ => Action::None,
+        }
+    }
+
+    fn confirm_pending(&mut self, force: bool) -> Action {
+        let pending = self.pending;
+        self.pending = Pending::None;
+        self.confirm_buf.clear();
+        match pending {
+            Pending::Clean => Action::CleanDeps,
+            Pending::Delete => Action::Delete {
+                force,
+                branches: self.branch_scope,
+            },
+            Pending::None => Action::None,
         }
     }
 
@@ -253,9 +334,8 @@ impl App {
             }
             KeyCode::Char('0') => {
                 self.query = Query::default();
-                self.selected.clear();
                 self.cursor = 0;
-                self.status = "showing all".to_string();
+                self.note = format!("view changed: {} matches", self.visible().len());
                 Action::None
             }
             KeyCode::Char('x') => {
@@ -285,12 +365,13 @@ impl App {
             .find(|wt| wt.path == path)
             .is_some_and(|wt| wt.deletable());
         if !deletable {
-            self.status = "the main checkout is only a reference and cannot be deleted".to_string();
+            self.note = "the main checkout is only a reference and cannot be deleted".to_string();
             return;
         }
         if !self.selected.remove(&path) {
             self.selected.insert(path);
         }
+        self.note = format!("selection changed: {} selected", self.selected.len());
     }
 
     fn toggle_all_visible(&mut self) {
@@ -303,7 +384,7 @@ impl App {
             })
             .collect();
         if paths.is_empty() {
-            self.status = "nothing here can be deleted".to_string();
+            self.note = "nothing here can be deleted".to_string();
             return;
         }
         let all_on = paths.iter().all(|path| self.selected.contains(path));
@@ -316,6 +397,10 @@ impl App {
                 self.selected.insert(path);
             }
         }
+        self.note = format!(
+            "selection changed: {} selected (a toggles visible rows)",
+            self.selected.len()
+        );
     }
 
     fn arm_delete(&mut self) {
@@ -323,10 +408,11 @@ impl App {
             self.toggle_current();
         }
         if self.selected.is_empty() {
-            self.status = "select a worktree to delete".to_string();
+            self.note = "select a worktree to delete".to_string();
             return;
         }
         self.pending = Pending::Delete;
+        self.confirm_buf.clear();
         self.branch_scope = remove::BranchScope::Keep;
     }
 
@@ -335,10 +421,11 @@ impl App {
             self.toggle_current();
         }
         if self.selected.is_empty() {
-            self.status = "select a worktree to clean".to_string();
+            self.note = "select a worktree to clean".to_string();
             return;
         }
         self.pending = Pending::Clean;
+        self.confirm_buf.clear();
     }
 
     fn apply_preset(&mut self, query: Query) {
@@ -346,17 +433,15 @@ impl App {
         self.filter.clear();
         self.filter_mode = false;
         self.pending = Pending::None;
-        self.cursor = 0;
-        self.selected.clear();
-        for idx in self.visible() {
-            let wt = &self.items[idx];
-            if wt.deletable() {
-                self.selected.insert(wt.path.clone());
-            }
-        }
-        self.status = format!(
-            "filter {}, {} selected. d delete, x clean deps",
-            self.query.label(),
+        self.confirm_buf.clear();
+        self.cursor = self
+            .visible()
+            .iter()
+            .position(|&idx| self.items[idx].deletable())
+            .unwrap_or(0);
+        self.note = format!(
+            "view changed: {} matches. selection unchanged: {} selected",
+            self.visible().len(),
             self.selected.len()
         );
     }
@@ -415,30 +500,59 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
             Action::None => {}
             Action::Quit => break,
             Action::Rescan => {
-                app.status = "rescanning…".to_string();
+                app.op = OperationStatus::Running {
+                    action: ActionKind::Scan,
+                    total: 0,
+                };
+                app.note = "rescanning…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
                 let result = scan::scan(&opts.roots, opts.max_depth);
-                app.apply_scan(result);
-                app.status = format!("refreshed, {} worktrees", app.items.len());
+                let pruned = app.apply_scan(result);
+                app.op = OperationStatus::Finished {
+                    succeeded: app.items.len(),
+                    failed: app.errors.len(),
+                };
+                app.note = if pruned > 0 {
+                    format!(
+                        "refreshed, {} worktrees. selection pruned: {pruned}",
+                        app.items.len()
+                    )
+                } else {
+                    format!("refreshed, {} worktrees", app.items.len())
+                };
             }
             Action::Delete { force, branches } => {
                 let paths: Vec<_> = app.selected.iter().cloned().collect();
-                app.status = "deleting…".to_string();
+                app.op = OperationStatus::Running {
+                    action: ActionKind::Delete,
+                    total: paths.len(),
+                };
+                app.note = "deleting…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
-                let message =
-                    remove::summarize(&remove::delete_many(&app.items, &paths, force, branches));
+                let items = ops::delete_targets(&app.items, &paths, &[], true, force, branches);
+                let (succeeded, failed) = ops::counts(&items);
+                app.op = OperationStatus::Finished { succeeded, failed };
+                app.note = ops::summarize_items(&items);
                 let result = scan::scan(&opts.roots, opts.max_depth);
-                app.apply_scan(result);
-                app.status = message;
+                let pruned = app.apply_scan(result);
+                if pruned > 0 {
+                    app.note = format!("{}. selection pruned: {pruned}", app.note);
+                }
             }
             Action::CleanDeps => {
                 let paths: Vec<_> = app.selected.iter().cloned().collect();
-                app.status = "cleaning dependencies…".to_string();
+                app.op = OperationStatus::Running {
+                    action: ActionKind::Clean,
+                    total: paths.len(),
+                };
+                app.note = "cleaning dependencies…".to_string();
                 terminal.draw(|frame| draw(frame, &app))?;
-                let message = remove::summarize_clean(&remove::clean_many(&app.items, &paths));
+                let items = ops::clean_targets(&app.items, &paths, &[], true);
+                let (succeeded, failed) = ops::counts(&items);
+                app.op = OperationStatus::Finished { succeeded, failed };
+                app.note = ops::summarize_items(&items);
                 let result = scan::scan(&opts.roots, opts.max_depth);
                 app.apply_scan(result);
-                app.status = message;
             }
         }
     }
@@ -454,16 +568,63 @@ impl Drop for Restore {
 }
 
 fn draw(frame: &mut Frame, app: &App) {
-    let foot_h = if app.pending == Pending::None { 9 } else { 12 };
+    let foot_h = match app.pending {
+        Pending::None if app.filter_mode => 7,
+        Pending::None => 9,
+        _ => 14,
+    };
     let chunks =
         Layout::vertical([Constraint::Min(3), Constraint::Length(foot_h)]).split(frame.area());
     draw_table(frame, app, chunks[0]);
     draw_footer(frame, app, chunks[1]);
 }
 
+struct ColumnSpec {
+    headers: Vec<&'static str>,
+    widths: Vec<Constraint>,
+    show_folder: bool,
+    show_path: bool,
+}
+
+fn column_spec(width: u16) -> ColumnSpec {
+    if width >= 110 {
+        ColumnSpec {
+            headers: vec![
+                "", "id", "active", "repo", "branch", "folder", "status", "path",
+            ],
+            widths: vec![
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Length(6),
+                Constraint::Length(14),
+                Constraint::Length(16),
+                Constraint::Length(20),
+                Constraint::Length(22),
+                Constraint::Min(16),
+            ],
+            show_folder: true,
+            show_path: true,
+        }
+    } else {
+        ColumnSpec {
+            headers: vec!["", "id", "repo", "branch", "age", "status"],
+            widths: vec![
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Length(14),
+                Constraint::Length(16),
+                Constraint::Length(6),
+                Constraint::Min(18),
+            ],
+            show_folder: false,
+            show_path: false,
+        }
+    }
+}
+
 fn draw_table(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let visible = app.visible();
-    let shown = if app.filter.is_empty() {
+    let shown = if app.filter.is_empty() && app.query.is_empty() {
         format!("{}", app.items.len())
     } else {
         format!("{}/{}", visible.len(), app.items.len())
@@ -473,8 +634,8 @@ fn draw_table(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         app.selected.len(),
         app.repos
     );
-    let header = Row::new(["", "active", "repo", "branch", "folder", "status", "path"])
-        .style(Style::new().add_modifier(Modifier::BOLD));
+    let spec = column_spec(area.width);
+    let header = Row::new(spec.headers.clone()).style(Style::new().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = visible
         .iter()
         .map(|&idx| {
@@ -486,28 +647,28 @@ fn draw_table(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             } else {
                 "·"
             };
-            Row::new([
-                Cell::from(mark),
-                Cell::from(age_label(wt.last_active, app.now)),
-                Cell::from(wt.repo.as_str()),
-                Cell::from(wt.branch.as_str()),
-                Cell::from(scan::shorten_path(&wt.parent)),
-                Cell::from(wt.flags()),
-                Cell::from(scan::shorten_path(&wt.path)),
-            ])
-            .style(row_style(wt, app.now))
+            let mut cells = vec![Cell::from(mark), Cell::from(wt.id_short())];
+            if spec.show_path || spec.show_folder {
+                cells.push(Cell::from(age_label(wt.last_active, app.now)));
+                cells.push(Cell::from(wt.repo.as_str()));
+                cells.push(Cell::from(wt.branch.as_str()));
+                if spec.show_folder {
+                    cells.push(Cell::from(scan::shorten_path(&wt.parent)));
+                }
+                cells.push(Cell::from(wt.flags()));
+                if spec.show_path {
+                    cells.push(Cell::from(scan::shorten_path(&wt.path)));
+                }
+            } else {
+                cells.push(Cell::from(wt.repo.as_str()));
+                cells.push(Cell::from(wt.branch.as_str()));
+                cells.push(Cell::from(age_label(wt.last_active, app.now)));
+                cells.push(Cell::from(wt.flags()));
+            }
+            Row::new(cells).style(row_style(wt, app.now))
         })
         .collect();
-    let widths = [
-        Constraint::Length(2),
-        Constraint::Length(6),
-        Constraint::Length(16),
-        Constraint::Length(22),
-        Constraint::Length(28),
-        Constraint::Length(16),
-        Constraint::Min(20),
-    ];
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, spec.widths)
         .header(header)
         .block(Block::bordered().title(title))
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -540,6 +701,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let lines = match app.pending {
         Pending::Delete => confirm_lines(app),
         Pending::Clean => clean_lines(app),
+        Pending::None if app.filter_mode => filter_lines(app),
         Pending::None => browse_lines(app),
     };
     let title = match app.pending {
@@ -552,6 +714,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(Block::bordered().title(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn filter_lines(app: &App) -> Vec<Line<'static>> {
+    vec![
+        Line::from(format!("filter: {}_", app.filter)),
+        Line::from("Enter apply    Esc clear"),
+        Line::from(app.status_text()),
+    ]
 }
 
 fn browse_lines(app: &App) -> Vec<Line<'static>> {
@@ -570,18 +740,14 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
             format!(
-                "{}  ·  {}  ·  active {when}  ·  created {created}  ·  {}",
+                "id {}  ·  {}  ·  {}  ·  active {when}  ·  created {created}  ·  {}",
+                wt.id,
                 scan::shorten_path(&wt.path),
                 wt.branch,
                 wt.flags()
             )
         }
         None => "no repos with linked worktrees".to_string(),
-    };
-    let filter = if app.filter.is_empty() {
-        String::new()
-    } else {
-        format!("filter: {}  ", app.filter)
     };
     vec![
         Line::from(detail),
@@ -592,9 +758,9 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
             ),
             Style::new().fg(Color::DarkGray),
         )),
-        Line::from(format!("{filter}{}", app.status)),
+        Line::from(app.status_text()),
         Line::from("m merged   i idle   s old+idle   0 all   x clean deps"),
-        Line::from("j/k move   space select   a all   d delete   b branch   / filter   r refresh   q quit"),
+        Line::from("j/k move   space select   a toggle visible   d delete   / filter   r refresh   q quit"),
     ]
 }
 
@@ -608,11 +774,12 @@ fn clean_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(
             "removes node_modules, target, .next, .turbo, .venv, venv, __pycache__, Pods, .gradle.",
         ),
-        Line::from("Enter confirm    Esc cancel"),
+        Line::from("y confirm    Esc cancel    Enter does nothing"),
     ];
     for wt in chosen.iter().take(6) {
         lines.push(Line::from(format!(
-            "  {}  {}",
+            "  {}  {}  {}",
+            wt.id_short(),
             wt.branch,
             scan::shorten_path(&wt.path)
         )));
@@ -632,21 +799,30 @@ fn selected_worktrees(app: &App) -> Vec<&Worktree> {
 
 fn confirm_lines(app: &App) -> Vec<Line<'static>> {
     let chosen = selected_worktrees(app);
-    let mut lines = vec![Line::from(format!(
-        "delete {} worktrees. branches: {}. Enter clean, f force, b cycle branches, Esc cancel.",
-        chosen.len(),
-        app.branch_scope.label()
-    ))];
-    for wt in chosen.iter().take(6) {
+    let typed = if app.confirm_buf.is_empty() {
+        "type y or delete to confirm".to_string()
+    } else {
+        format!("typed: {}_", app.confirm_buf)
+    };
+    let mut lines = vec![
+        Line::from(format!("delete {} worktrees", chosen.len())),
+        Line::from(format!("branch policy: {}", app.branch_scope.label())),
+        Line::from("y delete clean worktrees"),
+        Line::from("f force delete dirty or locked worktrees"),
+        Line::from("b branch policy: keep → local → GitHub"),
+        Line::from(format!("{typed}    Esc cancel    Enter does nothing")),
+    ];
+    for wt in chosen.iter().take(5) {
         lines.push(Line::from(format!(
-            "  {}  {}  {}",
+            "  {}  {}  {}  {}",
+            wt.id_short(),
             wt.flags(),
             wt.branch,
             scan::shorten_path(&wt.path)
         )));
     }
-    if chosen.len() > 6 {
-        lines.push(Line::from(format!("  …{} more", chosen.len() - 6)));
+    if chosen.len() > 5 {
+        lines.push(Line::from(format!("  …{} more", chosen.len() - 5)));
     }
     lines
 }
@@ -678,10 +854,12 @@ mod tests {
         app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
         assert_eq!(app.selected.len(), 1);
+        assert!(app.note.contains("selection changed"));
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
         assert_eq!(app.pending, Pending::Delete);
+        assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
         assert_eq!(
-            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
             Action::Delete {
                 force: false,
                 branches: remove::BranchScope::Keep,
@@ -691,7 +869,7 @@ mod tests {
         app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
         app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
         assert_eq!(
-            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
             Action::Delete {
                 force: false,
                 branches: remove::BranchScope::GitHub,
@@ -700,10 +878,50 @@ mod tests {
     }
 
     #[test]
-    fn presets_select_merged_idle_and_old() {
+    fn typing_delete_confirms() {
+        let mut app = app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(10)),
+            fixture("/repos/demo/.worktrees/feat", "demo", false, Some(10)),
+        ]);
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(
+            app.on_key(KeyCode::Char('d'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(
+            app.on_key(KeyCode::Char('e'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(
+            app.on_key(KeyCode::Char('l'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(
+            app.on_key(KeyCode::Char('e'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(
+            app.on_key(KeyCode::Char('t'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(
+            app.on_key(KeyCode::Char('e'), KeyModifiers::NONE),
+            Action::Delete {
+                force: false,
+                branches: remove::BranchScope::Keep,
+            }
+        );
+    }
+
+    #[test]
+    fn presets_filter_without_selecting() {
         let now = 1_000_000;
         let mut merged = fixture("/repos/demo/.worktrees/merged", "demo", false, Some(now));
         merged.merged = Some(true);
+        merged.branch = "merged".to_string();
+        merged.id = scan::stable_id("demo", "merged", &merged.path);
         let mut idle = fixture(
             "/repos/demo/.worktrees/idle",
             "demo",
@@ -711,6 +929,8 @@ mod tests {
             Some(now - 20 * 86_400),
         );
         idle.created_at = Some(now - 2 * 86_400);
+        idle.branch = "idle".to_string();
+        idle.id = scan::stable_id("demo", "idle", &idle.path);
         let mut old = fixture(
             "/repos/demo/.worktrees/old",
             "demo",
@@ -718,6 +938,8 @@ mod tests {
             Some(now - 20 * 86_400),
         );
         old.created_at = Some(now - 40 * 86_400);
+        old.branch = "old".to_string();
+        old.id = scan::stable_id("demo", "old", &old.path);
         let mut app = app_with(vec![
             fixture("/repos/demo", "demo", true, Some(now)),
             merged,
@@ -730,24 +952,38 @@ mod tests {
         app.stale_idle_secs = 7 * 86_400;
 
         app.on_key(KeyCode::Char('m'), KeyModifiers::NONE);
-        assert_eq!(app.selected.len(), 1);
-        assert!(app
-            .selected
-            .contains(&PathBuf::from("/repos/demo/.worktrees/merged")));
+        assert!(app.selected.is_empty());
+        assert!(app.query.merged_only);
+        assert!(app.note.contains("view changed"));
+        assert_eq!(app.visible().len(), 2);
 
         app.on_key(KeyCode::Char('i'), KeyModifiers::NONE);
-        assert_eq!(app.selected.len(), 2);
-
-        app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(app.selected.is_empty());
         assert_eq!(
-            app.selected.iter().cloned().collect::<Vec<_>>(),
-            vec![PathBuf::from("/repos/demo/.worktrees/old")]
+            app.visible()
+                .iter()
+                .filter(|&&i| app.items[i].deletable())
+                .count(),
+            2
         );
 
+        app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(app.selected.is_empty());
+        let deletable: Vec<_> = app
+            .visible()
+            .into_iter()
+            .filter(|&i| app.items[i].deletable())
+            .map(|i| app.items[i].path.clone())
+            .collect();
+        assert_eq!(deletable, vec![PathBuf::from("/repos/demo/.worktrees/old")]);
+
+        app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(app.selected.len(), 1);
         app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(app.pending, Pending::Clean);
+        assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
         assert_eq!(
-            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
             Action::CleanDeps
         );
     }
@@ -761,6 +997,7 @@ mod tests {
         ]);
         app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
         assert_eq!(app.selected.len(), 2);
+        assert!(app.note.contains("selection changed"));
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
         assert_eq!(
             app.on_key(KeyCode::Char('f'), KeyModifiers::NONE),
@@ -769,5 +1006,37 @@ mod tests {
                 branches: remove::BranchScope::Keep,
             }
         );
+    }
+
+    #[test]
+    fn refresh_reports_pruned_selection() {
+        let mut app = app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(10)),
+            fixture("/repos/demo/.worktrees/a", "demo", false, Some(1)),
+            fixture("/repos/demo/.worktrees/b", "demo", false, Some(2)),
+        ]);
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        let pruned = app.apply_scan(ScanResult {
+            repos: 1,
+            worktrees: vec![
+                fixture("/repos/demo", "demo", true, Some(10)),
+                fixture("/repos/demo/.worktrees/a", "demo", false, Some(1)),
+            ],
+            errors: Vec::new(),
+        });
+        assert_eq!(pruned, 1);
+        assert_eq!(app.selected.len(), 1);
+    }
+
+    #[test]
+    fn narrow_columns_hide_folder_and_path() {
+        let narrow = column_spec(80);
+        assert!(!narrow.show_folder);
+        assert!(!narrow.show_path);
+        assert!(narrow.headers.contains(&"status"));
+        assert!(narrow.headers.contains(&"repo"));
+        let wide = column_spec(140);
+        assert!(wide.show_folder);
+        assert!(wide.show_path);
     }
 }
