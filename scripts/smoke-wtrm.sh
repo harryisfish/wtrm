@@ -132,6 +132,7 @@ feat = next(r for r in data["worktrees"] if r["branch"] == "feature")
 assert feat["dirty"] is True, feat
 print("bulky dirty scan_ms", data["scan_ms"], "wall_ms", wall)
 PY
+rm -rf "$LINKED/untracked-blob"
 pass "bulky untracked dirty check"
 
 plan=$("$WTRM" plan --json --merged "$HOME_FAKE/project")
