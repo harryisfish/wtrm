@@ -6,7 +6,7 @@
 
 ## 安装
 
-[GitHub Release](https://github.com/harryisfish/wtrm/releases) 提供 macOS（arm64、x86_64）、Linux（x86_64）和 Windows（x86_64）的二进制包。当前版本是 `v0.0.1`。
+[GitHub Release](https://github.com/harryisfish/wtrm/releases) 提供 macOS（arm64、x86_64）、Linux（x86_64）和 Windows（x86_64）的二进制包。当前版本是 `v0.0.2`。
 
 从源码构建需要 Rust 1.85 或更新：
 
