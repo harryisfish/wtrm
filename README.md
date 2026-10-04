@@ -26,7 +26,7 @@ wtrm
 
 活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。只列出有附加 worktree 的仓库。主检出会显示，但不能删除。
 
-删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。确认删除时输入 `y` 或 `delete` 才删干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。`b` 切换分支策略：保留、只删本地，或连 GitHub 远程一起删。别的检出还在用的分支会留下。Enter 不会执行删除。
+删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。确认删除时输入 `y` 或 `delete` 才删干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。`b` 切换分支策略：保留、只删本地，或连 GitHub 远程一起删。别的检出还在用的分支会留下。Enter 不会执行删除。删除按条目进行，底部会留下 `last result`（`ok` / `blocked` / `failed` 和原因）；删完后立刻从列表去掉，不会再全盘扫描，需要最新状态时按 `r`。
 
 常用筛选：
 
@@ -88,7 +88,7 @@ JSON 顶层固定为：
 | `a` | 切换当前可见列表里全部可删除项（不是无条件全选） |
 | `d` | 确认删除 worktree |
 | `x` | 只清理选中 worktree 里的依赖目录 |
-| `y` 或输入 `delete` | 删除干净的 worktree；清理依赖时确认 |
+| `y` 或输入 `delete` | 删除干净的 worktree；清理依赖时确认。底部显示每条 `ok`/`blocked`/`failed` |
 | `f` | 强制删除，包括脏和锁定的 |
 | `b` | 确认删除时切换分支策略：保留、只删本地、或连 GitHub 远程一起删 |
 | `/` | 按文字过滤；Enter 应用，Esc 清空 |

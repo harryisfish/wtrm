@@ -200,11 +200,15 @@ pass "delete --yes"
 
 echo "== TUI quit =="
 python3 - "$WTRM" "$HOME_FAKE/project" <<'PY' || fail "TUI did not quit cleanly"
-import os, pty, select, sys, time
+import fcntl, os, pty, select, signal, struct, sys, termios, time
 wtrm, root = sys.argv[1], sys.argv[2]
 pid, fd = pty.fork()
 if pid == 0:
+    os.environ["COLUMNS"] = "120"
+    os.environ["LINES"] = "40"
     os.execvp(wtrm, [wtrm, root])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+os.kill(pid, signal.SIGWINCH)
 deadline = time.time() + 8
 buf = b""
 while time.time() < deadline:
@@ -217,7 +221,7 @@ while time.time() < deadline:
         if not chunk:
             break
         buf += chunk
-        if b"worktrees" in buf or b"help" in buf or b"j/k" in buf:
+        if b"j/k" in buf or b"help" in buf:
             os.write(fd, b"q")
             break
 os.write(fd, b"q")
@@ -235,6 +239,74 @@ for _ in range(20):
 sys.exit("TUI hung")
 PY
 pass "TUI quit"
+
+echo "== TUI delete =="
+python3 - "$WTRM" "$HOME_FAKE/project" "$IDLE" <<'PY' || fail "TUI delete hung or failed"
+import fcntl, os, pty, re, select, signal, struct, sys, termios, time
+wtrm, root, linked = sys.argv[1], sys.argv[2], sys.argv[3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["COLUMNS"] = "120"
+    os.environ["LINES"] = "40"
+    os.execvp(wtrm, [wtrm, root])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+os.kill(pid, signal.SIGWINCH)
+
+def plain(raw: bytes) -> bytes:
+    s = re.sub(rb"\x1b\[[0-9;?=]*[A-Za-z]", b"", raw)
+    return re.sub(rb"\s+", b"", s)
+
+deadline = time.time() + 15
+buf = b""
+sent_d = False
+sent_y = False
+saw_result = False
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.2)
+    if r:
+        try:
+            chunk = os.read(fd, 8192)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    text = plain(buf).lower()
+    if not sent_d and b"j/kmove" in text:
+        os.write(fd, b"d")
+        sent_d = True
+        continue
+    if sent_d and not sent_y and (b"confirmdelete" in text or b"typeyordelete" in text):
+        os.write(fd, b"y")
+        sent_y = True
+        continue
+    if sent_y and (b"succeeded" in text or b"lastresult" in text or b"finished:" in text):
+        saw_result = True
+        os.write(fd, b"q")
+        break
+os.write(fd, b"q")
+ok = False
+for _ in range(20):
+    wpid, status = os.waitpid(pid, os.WNOHANG)
+    if wpid:
+        ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        break
+    time.sleep(0.1)
+    try:
+        os.write(fd, b"q")
+    except OSError:
+        pass
+visible = plain(buf)[-1200:]
+if not saw_result:
+    sys.exit(f"no delete result in TUI: {visible!r}")
+if os.path.isdir(linked):
+    sys.exit(f"TUI delete left worktree in place; ui={visible!r}")
+if not ok:
+    sys.exit("TUI delete did not exit cleanly")
+sys.exit(0)
+PY
+[[ ! -d "$IDLE" ]] || fail "TUI delete left $IDLE"
+pass "TUI delete"
 
 echo "== cargo tests =="
 cargo test --locked

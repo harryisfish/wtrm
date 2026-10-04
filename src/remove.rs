@@ -98,30 +98,18 @@ pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
         }
     }
 
-    let mut cmd = Command::new("git");
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
-    if wt.repo_root.exists() {
-        cmd.arg("-C").arg(&wt.repo_root);
-    } else {
-        cmd.arg("--git-dir").arg(&wt.git_common_dir);
-    }
+    crate::git::leave_tree(&wt.path);
+    let mut cmd = git_at(wt);
     cmd.args(["worktree", "remove"]);
     if force {
         cmd.args(["--force", "--force"]);
     }
     cmd.arg(&wt.path);
-    let out = cmd
-        .output()
-        .map_err(|err| format!("cannot run git: {err}"))?;
+    let out = crate::git::output(cmd, crate::git::REMOVE)?;
     if out.status.success() {
         return Ok(());
     }
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if err.is_empty() {
-        "git worktree remove failed".to_string()
-    } else {
-        err
-    })
+    Err(git_err(&out, "git worktree remove failed"))
 }
 
 pub fn find_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -219,10 +207,9 @@ fn branch_still_used(wt: &Worktree, name: &str, items: &[Worktree], removed: &[&
 }
 
 fn delete_local_branch(wt: &Worktree, name: &str) -> Result<(), String> {
-    let out = git_at(wt)
-        .args(["branch", "-D", name])
-        .output()
-        .map_err(|err| format!("cannot run git: {err}"))?;
+    let mut cmd = git_at(wt);
+    cmd.args(["branch", "-D", name]);
+    let out = crate::git::output(cmd, crate::git::QUICK)?;
     if out.status.success() {
         Ok(())
     } else {
@@ -231,10 +218,9 @@ fn delete_local_branch(wt: &Worktree, name: &str) -> Result<(), String> {
 }
 
 fn delete_github_branch(wt: &Worktree, name: &str) -> Result<String, String> {
-    let out = git_at(wt)
-        .args(["remote", "-v"])
-        .output()
-        .map_err(|err| format!("cannot run git: {err}"))?;
+    let mut cmd = git_at(wt);
+    cmd.args(["remote", "-v"]);
+    let out = crate::git::output(cmd, crate::git::QUICK)?;
     if !out.status.success() {
         return Err(git_err(&out, "git remote failed"));
     }
@@ -242,11 +228,9 @@ fn delete_github_branch(wt: &Worktree, name: &str) -> Result<String, String> {
     let Some(remote) = github_remote(&text) else {
         return Err("no GitHub remote".to_string());
     };
-    let pushed = git_at(wt)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["push", &remote, "--delete", name])
-        .output()
-        .map_err(|err| format!("cannot run git: {err}"))?;
+    let mut pushed = git_at(wt);
+    pushed.args(["push", &remote, "--delete", name]);
+    let pushed = crate::git::output(pushed, crate::git::REMOVE)?;
     if pushed.status.success() {
         Ok(remote)
     } else {
@@ -274,8 +258,7 @@ fn github_remote(text: &str) -> Option<String> {
 }
 
 fn git_at(wt: &Worktree) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    let mut cmd = crate::git::command();
     if wt.repo_root.exists() {
         cmd.arg("-C").arg(&wt.repo_root);
     } else {
@@ -415,5 +398,62 @@ gitlab\tgit@gitlab.com:acme/demo.git (push)
         let wt = fixture("/repos/demo", "demo", true, Some(10));
         let err = delete_one(&wt, true).unwrap_err();
         assert!(err.contains("main checkout"));
+    }
+
+    #[test]
+    fn deletes_even_when_cwd_is_inside_worktree() {
+        let git = Command::new("git").arg("--version").output();
+        if git.map(|out| !out.status.success()).unwrap_or(true) {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("wtrm-cwd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let repo = root.join("demo");
+        let linked = root.join("demo-feature");
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        fs::write(repo.join("README"), "hi\n").unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.email=wtrm@example.com", "-c", "user.name=wtrm"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(git(&["add", "README"]));
+        assert!(git(&["commit", "-m", "init"]));
+        assert!(git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            linked.to_str().unwrap()
+        ]));
+        let result = crate::scan::load(
+            std::slice::from_ref(&root),
+            4,
+            &crate::scan::Query::default(),
+        );
+        let feature = result
+            .worktrees
+            .iter()
+            .find(|wt| wt.branch == "feature")
+            .unwrap()
+            .clone();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&linked).unwrap();
+        let deleted = delete_one(&feature, false);
+        let _ = std::env::set_current_dir(&prev);
+        deleted.unwrap();
+        assert!(!linked.exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }

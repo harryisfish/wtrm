@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -469,24 +468,21 @@ fn default_base(repo: &Path) -> Option<String> {
 }
 
 fn rev_exists(repo: &Path, rev: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
+    let mut cmd = crate::git::command();
+    cmd.arg("-C")
         .arg(repo)
-        .args(["rev-parse", "--verify", "--quiet", rev])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map(|output| output.status.success())
+        .args(["rev-parse", "--verify", "--quiet", rev]);
+    crate::git::output(cmd, crate::git::QUICK)
+        .map(|out| out.status.success())
         .unwrap_or(false)
 }
 
 fn is_ancestor(repo: &Path, head: &str, base: &str) -> Option<bool> {
-    let output = Command::new("git")
-        .arg("-C")
+    let mut cmd = crate::git::command();
+    cmd.arg("-C")
         .arg(repo)
-        .args(["merge-base", "--is-ancestor", head, base])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .ok()?;
+        .args(["merge-base", "--is-ancestor", head, base]);
+    let output = crate::git::output(cmd, crate::git::QUICK).ok()?;
     match output.status.code() {
         Some(0) => Some(true),
         Some(1) => Some(false),
@@ -628,35 +624,16 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 fn git_output(args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    let mut cmd = crate::git::command();
     cmd.args(args);
-    finish_git(cmd, args)
+    crate::git::stdout_text(cmd, crate::git::QUICK)
 }
 
 fn git_output_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    let mut cmd = crate::git::command();
     cmd.arg("-C").arg(dir);
     cmd.args(args);
-    finish_git(cmd, args)
-}
-
-fn finish_git(mut cmd: Command, args: &[&str]) -> Result<String, String> {
-    let out = cmd
-        .output()
-        .map_err(|err| format!("cannot run git: {err}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if err.is_empty() {
-            format!("git {} failed", args.join(" "))
-        } else {
-            err
-        });
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .trim_end_matches(['\n', '\r'])
-        .to_string())
+    crate::git::stdout_text(cmd, crate::git::QUICK)
 }
 
 pub fn shorten_path(path: &Path) -> String {
@@ -707,6 +684,7 @@ pub fn fixture(path: &str, repo: &str, main: bool, last_active: Option<i64>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn stable_id_is_deterministic_and_unique() {

@@ -1,3 +1,4 @@
+mod git;
 mod ops;
 mod remove;
 mod report;
