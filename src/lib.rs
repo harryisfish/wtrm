@@ -8,6 +8,7 @@ mod ui;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{bail, Context};
 use clap::{Args, Parser, Subcommand};
@@ -155,11 +156,15 @@ fn run_scan_or_tui(cli: &Cli) -> anyhow::Result<()> {
         },
     };
     if cli.json {
-        let result = scan::load(&opts.roots, opts.max_depth, &opts.query);
-        return emit_report(&Report::from_scan(&opts.roots, result), true);
+        let (result, ms) = timed_load(&opts.roots, opts.max_depth, &opts.query);
+        return emit_report(
+            &Report::from_scan(&opts.roots, result).with_scan_ms(ms),
+            true,
+        );
     }
     if cli.list || !io::stdout().is_terminal() {
-        let result = scan::load(&opts.roots, opts.max_depth, &opts.query);
+        let (result, ms) = timed_load(&opts.roots, opts.max_depth, &opts.query);
+        note_scan_time(ms, &result);
         print_table(&result);
         report_errors(&result);
         return Ok(());
@@ -168,10 +173,12 @@ fn run_scan_or_tui(cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn run_plan(cli: &Cli) -> anyhow::Result<()> {
-    let (roots, result) = load_scan(cli)?;
+    let (roots, result, ms) = load_scan(cli)?;
     let items = ops::plan_delete(&result.worktrees);
     emit_report(
-        &Report::from_scan(&roots, result).with_items(items),
+        &Report::from_scan(&roots, result)
+            .with_scan_ms(ms)
+            .with_items(items),
         cli.json,
     )
 }
@@ -179,7 +186,7 @@ fn run_plan(cli: &Cli) -> anyhow::Result<()> {
 fn run_delete(cli: &Cli, args: &DeleteArgs) -> anyhow::Result<()> {
     require_targets(&args.path, &args.id)?;
     let execute = args.yes && !args.dry_run;
-    let (roots, result) = load_scan_with_targets(cli, &args.path)?;
+    let (roots, result, ms) = load_scan_with_targets(cli, &args.path)?;
     let items = ops::delete_targets(
         &result.worktrees,
         &args.path,
@@ -188,7 +195,9 @@ fn run_delete(cli: &Cli, args: &DeleteArgs) -> anyhow::Result<()> {
         args.force,
         args.branches,
     );
-    let report = Report::from_scan(&roots, result).with_items(items);
+    let report = Report::from_scan(&roots, result)
+        .with_scan_ms(ms)
+        .with_items(items);
     emit_report(&report, cli.json)?;
     fail_if_needed(&report, execute)
 }
@@ -196,9 +205,11 @@ fn run_delete(cli: &Cli, args: &DeleteArgs) -> anyhow::Result<()> {
 fn run_clean(cli: &Cli, args: &CleanArgs) -> anyhow::Result<()> {
     require_targets(&args.path, &args.id)?;
     let execute = args.yes && !args.dry_run;
-    let (roots, result) = load_scan_with_targets(cli, &args.path)?;
+    let (roots, result, ms) = load_scan_with_targets(cli, &args.path)?;
     let items = ops::clean_targets(&result.worktrees, &args.path, &args.id, execute);
-    let report = Report::from_scan(&roots, result).with_items(items);
+    let report = Report::from_scan(&roots, result)
+        .with_scan_ms(ms)
+        .with_items(items);
     emit_report(&report, cli.json)?;
     fail_if_needed(&report, execute)
 }
@@ -220,17 +231,17 @@ fn fail_if_needed(report: &Report, execute: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_scan(cli: &Cli) -> anyhow::Result<(Vec<PathBuf>, ScanResult)> {
+fn load_scan(cli: &Cli) -> anyhow::Result<(Vec<PathBuf>, ScanResult, u64)> {
     let query = query_from(&cli.scan)?;
     let roots = resolve_roots(&cli.scan)?;
-    let result = scan::load(&roots, cli.scan.max_depth, &query);
-    Ok((roots, result))
+    let (result, ms) = timed_load(&roots, cli.scan.max_depth, &query);
+    Ok((roots, result, ms))
 }
 
 fn load_scan_with_targets(
     cli: &Cli,
     targets: &[PathBuf],
-) -> anyhow::Result<(Vec<PathBuf>, ScanResult)> {
+) -> anyhow::Result<(Vec<PathBuf>, ScanResult, u64)> {
     let mut roots = resolve_roots(&cli.scan)?;
     for path in targets {
         if let Some(parent) = path.parent() {
@@ -243,8 +254,24 @@ fn load_scan_with_targets(
             }
         }
     }
-    let result = scan::load(&roots, cli.scan.max_depth, &Query::default());
-    Ok((roots, result))
+    let (result, ms) = timed_load(&roots, cli.scan.max_depth, &Query::default());
+    Ok((roots, result, ms))
+}
+
+fn timed_load(roots: &[PathBuf], max_depth: u8, query: &Query) -> (ScanResult, u64) {
+    let start = Instant::now();
+    let result = scan::load(roots, max_depth, query);
+    (result, start.elapsed().as_millis() as u64)
+}
+
+fn note_scan_time(ms: u64, result: &ScanResult) {
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "wtrm: scanned {} worktrees in {:.2}s",
+            result.worktrees.len(),
+            ms as f32 / 1000.0
+        );
+    }
 }
 
 fn query_from(scan: &ScanArgs) -> anyhow::Result<Query> {

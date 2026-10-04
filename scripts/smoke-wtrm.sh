@@ -96,6 +96,8 @@ text = sys.argv[1]
 data = json.loads(text)
 assert data["schema_version"] == 1, data
 assert data["complete"] is True, data
+assert isinstance(data["scan_ms"], int), data
+assert data["scan_ms"] >= 0, data
 assert isinstance(data["roots"], list), data
 assert isinstance(data["errors"], list), data
 assert isinstance(data["items"], list), data
@@ -111,6 +113,26 @@ assert all("id" in r and r["id"] for r in rows), rows
 print("json rows ok", sorted(by))
 PY
 pass "json"
+
+echo "== bulky untracked dirty check =="
+mkdir -p "$LINKED/untracked-blob"
+for i in $(seq 1 800); do
+  printf x >"$LINKED/untracked-blob/f$i"
+done
+start_ms=$(date +%s%3N)
+json_dirty=$("$WTRM" --json "$HOME_FAKE/project")
+end_ms=$(date +%s%3N)
+python3 - "$json_dirty" "$start_ms" "$end_ms" <<'PY' || fail "bulky dirty scan"
+import json, sys
+data = json.loads(sys.argv[1])
+wall = int(sys.argv[3]) - int(sys.argv[2])
+assert data["scan_ms"] < 2500, data
+assert wall < 4000, wall
+feat = next(r for r in data["worktrees"] if r["branch"] == "feature")
+assert feat["dirty"] is True, feat
+print("bulky dirty scan_ms", data["scan_ms"], "wall_ms", wall)
+PY
+pass "bulky untracked dirty check"
 
 plan=$("$WTRM" plan --json --merged "$HOME_FAKE/project")
 python3 - "$plan" <<'PY' || fail "plan json"
