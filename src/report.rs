@@ -15,6 +15,7 @@ pub struct Report {
     pub items: Vec<ActionItem>,
     pub errors: Vec<String>,
     pub complete: bool,
+    pub scan_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,7 +38,13 @@ impl Report {
             items: Vec::new(),
             errors: result.errors,
             complete: true,
+            scan_ms: 0,
         }
+    }
+
+    pub fn with_scan_ms(mut self, scan_ms: u64) -> Self {
+        self.scan_ms = scan_ms;
+        self
     }
 
     pub fn with_items(mut self, items: Vec<ActionItem>) -> Self {
@@ -113,6 +120,7 @@ mod tests {
         assert!(json["items"].is_array());
         assert!(json["errors"].is_array());
         assert_eq!(json["complete"], true);
+        assert_eq!(json["scan_ms"], 0);
         assert_eq!(json["items"][0]["action"], "delete");
         assert_eq!(json["items"][0]["result"], "dry-run");
         assert_eq!(json["worktrees"][0]["id"], wt.id);

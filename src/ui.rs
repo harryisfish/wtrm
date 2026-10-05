@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -90,6 +92,7 @@ pub struct App {
     pub stale_created_secs: i64,
     pub stale_idle_secs: i64,
     pub branch_scope: remove::BranchScope,
+    visible: Vec<usize>,
 }
 
 impl App {
@@ -116,6 +119,7 @@ impl App {
             stale_created_secs: 30 * 86_400,
             stale_idle_secs: 7 * 86_400,
             branch_scope: remove::BranchScope::Keep,
+            visible: Vec::new(),
         };
         app.apply_scan(result);
         app.note = if let Some(err) = errors.first() {
@@ -198,10 +202,23 @@ impl App {
         }
     }
 
-    pub fn visible(&self) -> Vec<usize> {
+    pub fn visible(&self) -> &[usize] {
+        &self.visible
+    }
+
+    fn scanning(&self) -> bool {
+        matches!(
+            self.op,
+            OperationStatus::Running {
+                action: ActionKind::Scan,
+                ..
+            }
+        )
+    }
+
+    fn rebuild_visible(&mut self) {
         let query = self.filter.to_lowercase();
-        let indexes = scan::matching_indexes(&self.items, &self.query, self.now);
-        indexes
+        self.visible = scan::matching_indexes(&self.items, &self.query, self.now)
             .into_iter()
             .filter(|idx| {
                 let wt = &self.items[*idx];
@@ -219,7 +236,7 @@ impl App {
                 );
                 blob.to_lowercase().contains(&query)
             })
-            .collect()
+            .collect();
     }
 
     pub fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
@@ -242,11 +259,13 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.filter_mode = false;
-                self.note = format!("view changed: {} matches", self.visible().len());
+                self.rebuild_visible();
+                self.note = format!("view changed: {} matches", self.visible.len());
             }
             KeyCode::Enter => {
                 self.filter_mode = false;
-                self.note = format!("view changed: {} matches", self.visible().len());
+                self.rebuild_visible();
+                self.note = format!("view changed: {} matches", self.visible.len());
             }
             KeyCode::Backspace => {
                 self.filter.pop();
@@ -326,6 +345,12 @@ impl App {
     }
 
     fn on_browse_key(&mut self, code: KeyCode) -> Action {
+        if self.scanning() && self.items.is_empty() {
+            return match code {
+                KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+                _ => Action::None,
+            };
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -385,7 +410,8 @@ impl App {
             KeyCode::Char('0') => {
                 self.query = Query::default();
                 self.cursor = 0;
-                self.note = format!("view changed: {} matches", self.visible().len());
+                self.rebuild_visible();
+                self.note = format!("view changed: {} matches", self.visible.len());
                 Action::None
             }
             KeyCode::Char('x') => {
@@ -426,9 +452,9 @@ impl App {
 
     fn toggle_all_visible(&mut self) {
         let paths: Vec<PathBuf> = self
-            .visible()
-            .into_iter()
-            .filter_map(|idx| {
+            .visible
+            .iter()
+            .filter_map(|&idx| {
                 let wt = &self.items[idx];
                 wt.deletable().then(|| wt.path.clone())
             })
@@ -486,25 +512,27 @@ impl App {
         self.filter_mode = false;
         self.pending = Pending::None;
         self.confirm_buf.clear();
+        self.rebuild_visible();
         self.cursor = self
-            .visible()
+            .visible
             .iter()
             .position(|&idx| self.items[idx].deletable())
             .unwrap_or(0);
         self.note = format!(
             "view changed: {} matches. selection unchanged: {} selected",
-            self.visible().len(),
+            self.visible.len(),
             self.selected.len()
         );
     }
 
     fn current_path(&self) -> Option<PathBuf> {
-        let idx = *self.visible().get(self.cursor)?;
+        let idx = *self.visible.get(self.cursor)?;
         self.items.get(idx).map(|wt| wt.path.clone())
     }
 
     fn clamp_cursor(&mut self) {
-        let len = self.visible().len();
+        self.rebuild_visible();
+        let len = self.visible.len();
         if len == 0 {
             self.cursor = 0;
         } else if self.cursor >= len {
@@ -520,111 +548,181 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
         .map(|path| scan::shorten_path(path))
         .collect::<Vec<_>>()
         .join(", ");
-    eprintln!("scanning {roots_label} …");
-    let result = scan::scan(&opts.roots, opts.max_depth);
-    eprintln!(
-        "found {} worktrees ({} repos)",
-        result.worktrees.len(),
-        result.repos
-    );
     if !io::stdout().is_terminal() {
         anyhow::bail!("stdout is not a terminal. use --list or --json");
     }
-    let mut app = App::from_scan(result, roots_label);
-    app.query = opts.query;
+    let mut app = App::from_scan(ScanResult::default(), roots_label.clone());
+    app.query = opts.query.clone();
     app.inactive_secs = opts.inactive_secs;
     app.stale_created_secs = opts.stale_created_secs;
     app.stale_idle_secs = opts.stale_idle_secs;
+    app.op = OperationStatus::Running {
+        action: ActionKind::Scan,
+        total: 0,
+    };
+    app.note = format!("scanning {roots_label} …");
     let mut terminal = ratatui::try_init().context("cannot enter the terminal ui")?;
     let _restore = Restore;
+    let mut scan_rx = Some(spawn_scan(&opts.roots, opts.max_depth));
+    let mut scan_started = Instant::now();
+    let mut last_tick = Instant::now();
+    let mut need_draw = true;
     loop {
-        terminal.draw(|frame| draw(frame, &app))?;
-        if !event::poll(Duration::from_millis(200))? {
-            continue;
+        if let Some(rx) = scan_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    let count = result.worktrees.len();
+                    app.query = opts.query.clone();
+                    let pruned = app.apply_scan(result);
+                    app.op = OperationStatus::Idle;
+                    app.note = if pruned > 0 {
+                        format!("scanned {count} worktrees. selection pruned: {pruned}")
+                    } else {
+                        format!("scanned {roots_label}, {count} worktrees")
+                    };
+                    scan_rx = None;
+                    need_draw = true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.op = OperationStatus::Idle;
+                    app.note = "scan failed".to_string();
+                    scan_rx = None;
+                    need_draw = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if last_tick.elapsed() >= Duration::from_millis(200) {
+                        app.note = format!(
+                            "scanning {roots_label} … {:.1}s",
+                            scan_started.elapsed().as_secs_f32()
+                        );
+                        last_tick = Instant::now();
+                        need_draw = true;
+                    }
+                }
+            }
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        if need_draw {
+            terminal.draw(|frame| draw(frame, &app))?;
+            need_draw = false;
+        }
+        let wait = if scan_rx.is_some() {
+            Duration::from_millis(33)
+        } else {
+            Duration::from_secs(30)
         };
-        if key.kind == KeyEventKind::Release {
+        if !event::poll(wait)? {
             continue;
         }
-        match app.on_key(key.code, key.modifiers) {
-            Action::None => {}
-            Action::Quit => break,
-            Action::Rescan => {
-                app.op = OperationStatus::Running {
-                    action: ActionKind::Scan,
-                    total: 0,
-                };
-                app.note = "rescanning…".to_string();
-                terminal.draw(|frame| draw(frame, &app))?;
-                let result = scan::scan(&opts.roots, opts.max_depth);
-                let pruned = app.apply_scan(result);
-                app.op = OperationStatus::Finished {
-                    succeeded: app.items.len(),
-                    failed: app.errors.len(),
-                };
-                app.note = if pruned > 0 {
-                    format!(
-                        "refreshed, {} worktrees. selection pruned: {pruned}",
-                        app.items.len()
-                    )
-                } else {
-                    format!("refreshed, {} worktrees", app.items.len())
-                };
-            }
-            Action::Delete { force, branches } => {
-                let paths: Vec<_> = app.selected.iter().cloned().collect();
-                let mut all = Vec::new();
-                for (i, path) in paths.iter().enumerate() {
-                    app.op = OperationStatus::Running {
-                        action: ActionKind::Delete,
-                        total: paths.len(),
-                    };
-                    app.note = format!(
-                        "deleting {}/{}  {}",
-                        i + 1,
-                        paths.len(),
-                        scan::shorten_path(path)
-                    );
-                    terminal.draw(|frame| draw(frame, &app))?;
-                    all.extend(ops::delete_targets(
-                        &app.items,
-                        std::slice::from_ref(path),
-                        &[],
-                        true,
-                        force,
-                        branches,
-                    ));
+        while let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Release {
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                app.apply_mutate_result(all);
+                continue;
             }
-            Action::CleanDeps => {
-                let paths: Vec<_> = app.selected.iter().cloned().collect();
-                let mut all = Vec::new();
-                for (i, path) in paths.iter().enumerate() {
-                    app.op = OperationStatus::Running {
-                        action: ActionKind::Clean,
-                        total: paths.len(),
-                    };
-                    app.note = format!(
-                        "cleaning {}/{}  {}",
-                        i + 1,
-                        paths.len(),
-                        scan::shorten_path(path)
-                    );
-                    terminal.draw(|frame| draw(frame, &app))?;
-                    all.extend(ops::clean_targets(
-                        &app.items,
-                        std::slice::from_ref(path),
-                        &[],
-                        true,
-                    ));
+            match app.on_key(key.code, key.modifiers) {
+                Action::None => {}
+                Action::Quit => return Ok(()),
+                Action::Rescan => {
+                    if scan_rx.is_none() {
+                        app.op = OperationStatus::Running {
+                            action: ActionKind::Scan,
+                            total: 0,
+                        };
+                        app.note = "rescanning…".to_string();
+                        scan_started = Instant::now();
+                        last_tick = Instant::now();
+                        scan_rx = Some(spawn_scan(&opts.roots, opts.max_depth));
+                    }
                 }
-                app.apply_mutate_result(all);
+                Action::Delete { force, branches } => {
+                    if scan_rx.is_some() {
+                        app.note = "wait for scan to finish".to_string();
+                    } else {
+                        run_delete(&mut terminal, &mut app, force, branches)?;
+                    }
+                }
+                Action::CleanDeps => {
+                    if scan_rx.is_some() {
+                        app.note = "wait for scan to finish".to_string();
+                    } else {
+                        run_clean(&mut terminal, &mut app)?;
+                    }
+                }
+            }
+            need_draw = true;
+            if !event::poll(Duration::ZERO)? {
+                break;
             }
         }
     }
+}
+
+fn spawn_scan(roots: &[PathBuf], max_depth: u8) -> Receiver<ScanResult> {
+    let (tx, rx) = mpsc::channel();
+    let roots = roots.to_vec();
+    thread::spawn(move || {
+        let _ = tx.send(scan::scan(&roots, max_depth));
+    });
+    rx
+}
+
+fn run_delete(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    force: bool,
+    branches: remove::BranchScope,
+) -> anyhow::Result<()> {
+    let paths: Vec<_> = app.selected.iter().cloned().collect();
+    let mut all = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        app.op = OperationStatus::Running {
+            action: ActionKind::Delete,
+            total: paths.len(),
+        };
+        app.note = format!(
+            "deleting {}/{}  {}",
+            i + 1,
+            paths.len(),
+            scan::shorten_path(path)
+        );
+        terminal.draw(|frame| draw(frame, app))?;
+        all.extend(ops::delete_targets(
+            &app.items,
+            std::slice::from_ref(path),
+            &[],
+            true,
+            force,
+            branches,
+        ));
+    }
+    app.apply_mutate_result(all);
+    Ok(())
+}
+
+fn run_clean(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    let paths: Vec<_> = app.selected.iter().cloned().collect();
+    let mut all = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        app.op = OperationStatus::Running {
+            action: ActionKind::Clean,
+            total: paths.len(),
+        };
+        app.note = format!(
+            "cleaning {}/{}  {}",
+            i + 1,
+            paths.len(),
+            scan::shorten_path(path)
+        );
+        terminal.draw(|frame| draw(frame, app))?;
+        all.extend(ops::clean_targets(
+            &app.items,
+            std::slice::from_ref(path),
+            &[],
+            true,
+        ));
+    }
+    app.apply_mutate_result(all);
     Ok(())
 }
 
@@ -643,6 +741,7 @@ fn draw(frame: &mut Frame, app: &App) {
         (app.last_result.len().min(4) as u16).saturating_add(1)
     };
     let foot_h = match app.pending {
+        Pending::None if app.scanning() && app.items.is_empty() => 4 + extra,
         Pending::None if app.filter_mode => 7 + extra,
         Pending::None => 9 + extra,
         _ => 14,
@@ -710,7 +809,17 @@ fn draw_table(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
     let spec = column_spec(area.width);
     let header = Row::new(spec.headers.clone()).style(Style::new().add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = visible
+    let rows_h = area.height.saturating_sub(3) as usize;
+    let len = visible.len();
+    let (start, end) = if len == 0 || rows_h == 0 {
+        (0, 0)
+    } else {
+        let cursor = app.cursor.min(len - 1);
+        let start = cursor.saturating_sub(rows_h.saturating_sub(1));
+        let end = (start + rows_h).min(len);
+        (start, end)
+    };
+    let rows: Vec<Row> = visible[start..end]
         .iter()
         .map(|&idx| {
             let wt = &app.items[idx];
@@ -748,8 +857,8 @@ fn draw_table(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
     let mut state = TableState::default();
-    if !visible.is_empty() {
-        state.select(Some(app.cursor.min(visible.len() - 1)));
+    if end > start {
+        state.select(Some(app.cursor.min(len - 1) - start));
     }
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -800,6 +909,12 @@ fn filter_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn browse_lines(app: &App) -> Vec<Line<'static>> {
+    if app.scanning() && app.items.is_empty() {
+        return vec![
+            Line::from(app.status_text()),
+            Line::from("q quit    scanning…"),
+        ];
+    }
     let detail = match app
         .visible()
         .get(app.cursor)
@@ -1072,7 +1187,8 @@ mod tests {
         assert!(app.selected.is_empty());
         let deletable: Vec<_> = app
             .visible()
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|&i| app.items[i].deletable())
             .map(|i| app.items[i].path.clone())
             .collect();
@@ -1200,5 +1316,42 @@ mod tests {
         assert!(app.note.contains("blocked"));
         assert!(app.note.contains("dirty"));
         assert_eq!(app.last_result[0].result, "blocked");
+    }
+
+    #[test]
+    fn empty_scan_only_accepts_quit() {
+        let mut app = app_with(Vec::new());
+        app.op = OperationStatus::Running {
+            action: ActionKind::Scan,
+            total: 0,
+        };
+        assert_eq!(
+            app.on_key(KeyCode::Char('d'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(
+            app.on_key(KeyCode::Char('j'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(app.pending, Pending::None);
+        assert_eq!(
+            app.on_key(KeyCode::Char('q'), KeyModifiers::NONE),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn rescan_with_rows_still_selects() {
+        let mut app = app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(10)),
+            fixture("/repos/demo/.worktrees/feat", "demo", false, Some(10)),
+        ]);
+        app.op = OperationStatus::Running {
+            action: ActionKind::Scan,
+            total: 0,
+        };
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(app.selected.len(), 1);
     }
 }

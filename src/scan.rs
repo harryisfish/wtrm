@@ -26,9 +26,20 @@ const SKIP_DIRS: &[&str] = &[
     ".npm",
     ".cargo",
     ".rustup",
+    ".pnpm-store",
     "Pictures",
     "Movies",
     "Music",
+    "coverage",
+    "htmlcov",
+    "bower_components",
+    ".turbo",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".nuxt",
+    ".output",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,10 +410,7 @@ fn enrich(job: Job) -> Worktree {
     let (dirty, last_commit, last_active) = if job.raw.bare || missing {
         (None, None, None)
     } else {
-        let dirty = match git_output_in(&path, &["status", "--porcelain"]) {
-            Ok(text) => Some(!text.trim().is_empty()),
-            Err(_) => None,
-        };
+        let dirty = dirty_status(&path);
         let last_commit = git_output_in(&path, &["log", "-1", "--format=%ct"])
             .ok()
             .and_then(|text| text.trim().parse::<i64>().ok());
@@ -443,6 +451,20 @@ fn enrich(job: Job) -> Worktree {
         created_at,
         created_utc: created_at.map(format_utc),
     }
+}
+
+fn dirty_status(path: &Path) -> Option<bool> {
+    let text = git_output_in(
+        path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-unormal",
+            "--ignore-submodules=all",
+        ],
+    )
+    .ok()?;
+    Some(!text.trim().is_empty())
 }
 
 fn default_base(repo: &Path) -> Option<String> {
@@ -891,6 +913,43 @@ prunable gitdir file points to non-existent location
         assert!(refused.contains("clean"), "{refused}");
         crate::remove::delete_one(dirty, true).unwrap();
         assert!(!linked.exists());
+    }
+
+    #[test]
+    fn dirty_check_on_untracked_dir_stays_fast() {
+        let git = Command::new("git").arg("--version").output();
+        if git.map(|out| !out.status.success()).unwrap_or(true) {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("wtrm-dirty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let _cleanup = scopeguard(&root);
+        let repo = root.join("demo");
+        assert!(Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repo.join("README"), "hi\n").unwrap();
+        assert!(git_in(&repo, &["add", "README"]));
+        assert!(git_in(&repo, &["commit", "-m", "init"]));
+
+        let bulky = repo.join("untracked-blob");
+        fs::create_dir_all(&bulky).unwrap();
+        for i in 0..2500 {
+            fs::write(bulky.join(format!("f{i}")), "x").unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let dirty = dirty_status(&repo);
+        let elapsed = start.elapsed();
+        assert_eq!(dirty, Some(true));
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "dirty check walked untracked files: {elapsed:?}"
+        );
     }
 
     fn scopeguard(path: &Path) -> impl Drop {

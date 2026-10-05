@@ -1,6 +1,6 @@
-use std::io::Read;
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
 
 pub const QUICK: Duration = Duration::from_secs(20);
 pub const REMOVE: Duration = Duration::from_secs(120);
@@ -18,47 +18,44 @@ pub fn output(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|err| format!("cannot run git: {err}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing git stdout".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "missing git stderr".to_string())?;
-    let stdout_h = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
     });
-    let stderr_h = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("git timed out after {}s", timeout.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
-            Err(err) => return Err(format!("cannot run git: {err}")),
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(err)) => Err(format!("cannot run git: {err}")),
+        Err(_) => {
+            kill_pid(pid);
+            let _ = rx.recv();
+            Err(format!("git timed out after {}s", timeout.as_secs()))
         }
-    };
-    let stdout = stdout_h.join().unwrap_or_default();
-    let stderr = stderr_h.join().unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    }
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 pub fn stdout_text(cmd: Command, timeout: Duration) -> Result<String, String> {
@@ -97,5 +94,19 @@ mod tests {
         cmd.arg("8");
         let err = output(cmd, Duration::from_millis(200)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn git_version_returns_without_polling_delay() {
+        let start = std::time::Instant::now();
+        let mut cmd = command();
+        cmd.arg("--version");
+        let text = stdout_text(cmd, QUICK).unwrap();
+        assert!(text.contains("git version"), "{text}");
+        assert!(
+            start.elapsed() < Duration::from_millis(800),
+            "git --version took {:?}",
+            start.elapsed()
+        );
     }
 }

@@ -26,6 +26,8 @@ wtrm
 
 活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。只列出有附加 worktree 的仓库。主检出会显示，但不能删除。
 
+启动后立刻进入界面，扫描在后台进行；空列表时只响应 `q`。扫描不走进 `node_modules` 这类依赖目录。脏工作区检测用 `git status --porcelain=v1 -unormal`，不会把未跟踪目录（例如巨大的 `node_modules`）逐文件走一遍。
+
 删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。确认删除时输入 `y` 或 `delete` 才删干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。`b` 切换分支策略：保留、只删本地，或连 GitHub 远程一起删。别的检出还在用的分支会留下。Enter 不会执行删除。删除按条目进行，底部会留下 `last result`（`ok` / `blocked` / `failed` 和原因）；删完后立刻从列表去掉，不会再全盘扫描，需要最新状态时按 `r`。
 
 常用筛选：
@@ -67,11 +69,12 @@ JSON 顶层固定为：
   "worktrees": [],
   "items": [],
   "errors": [],
-  "complete": true
+  "complete": true,
+  "scan_ms": 42
 }
 ```
 
-`worktrees` 仍是扫描结果，每项带 `id`。`plan` / `delete` / `clean` 的 `items` 固定包含 `action`、`id`、`path`、`reason`、`blocked_by`、`result`。`result` 为 `dry-run`、`ok`、`blocked` 或 `failed`。主检出、脏工作区、锁定会标 `blocked_by`。扫描完成但没有匹配时：`complete` 为 true、`worktrees` / `items` 为空。部分根读失败时错误在 `errors` 里，`complete` 仍为 true。
+`worktrees` 仍是扫描结果，每项带 `id`。`plan` / `delete` / `clean` 的 `items` 固定包含 `action`、`id`、`path`、`reason`、`blocked_by`、`result`。`result` 为 `dry-run`、`ok`、`blocked` 或 `failed`。主检出、脏工作区、锁定会标 `blocked_by`。`scan_ms` 是这次扫描耗时（毫秒）。扫描完成但没有匹配时：`complete` 为 true、`worktrees` / `items` 为空。部分根读失败时错误在 `errors` 里，`complete` 仍为 true。JSON 写在 stdout；`--list` 在 stderr 是终端时会额外打一行耗时，JSON 模式不写这行。
 
 `--list` 表格第一列是短 id（8 位）。完整 16 位 id 在 JSON 和 TUI 详情行。`delete` / `clean` 必须带 `--path` 或 `--id`。
 
