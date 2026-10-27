@@ -28,6 +28,8 @@ wtrm
 
 启动后立刻进入界面，扫描在后台进行；空列表时只响应 `q`。扫描不走进 `node_modules` 这类依赖目录。脏工作区检测用 `git status --porcelain=v1 -unormal`，不会把未跟踪目录（例如巨大的 `node_modules`）逐文件走一遍。
 
+扫描也跳过路径中包含 `trash` 的目录，不区分大小写，已登记的工作树也遵守这个排除规则。
+
 删除走 `git worktree remove`，由 git 移除该 worktree 的目录。主检出不会被删。确认删除时输入 `y` 或 `delete` 才删干净的 worktree；路径已经不在、且未锁定的也可以。`f` 对脏工作区或锁定的 worktree 使用 `--force --force`。`b` 切换分支策略：保留、只删本地，或连 GitHub 远程一起删。别的检出还在用的分支会留下。Enter 不会执行删除。删除按条目进行，底部会留下 `last result`（`ok` / `blocked` / `failed` 和原因）；删完后立刻从列表去掉，不会再全盘扫描，需要最新状态时按 `r`。
 
 常用筛选：
@@ -77,6 +79,46 @@ JSON 顶层固定为：
 `worktrees` 仍是扫描结果，每项带 `id`。`plan` / `delete` / `clean` 的 `items` 固定包含 `action`、`id`、`path`、`reason`、`blocked_by`、`result`。`result` 为 `dry-run`、`ok`、`blocked` 或 `failed`。主检出、脏工作区、锁定会标 `blocked_by`。`scan_ms` 是这次扫描耗时（毫秒）。扫描完成但没有匹配时：`complete` 为 true、`worktrees` / `items` 为空。部分根读失败时错误在 `errors` 里，`complete` 仍为 true。JSON 写在 stdout；`--list` 在 stderr 是终端时会额外打一行耗时，JSON 模式不写这行。
 
 `--list` 表格第一列是短 id（8 位）。完整 16 位 id 在 JSON 和 TUI 详情行。`delete` / `clean` 必须带 `--path` 或 `--id`。
+
+## 自动回收 macOS 外置盘
+
+`scripts/reclaim-space.py` 默认只生成报告。`--apply` 才回收已合并工作树和旧 Turbo 缓存，保留所有分支，不运行 `clean` 或 `--force`。
+
+工作树必须创建满 7 天。程序检查 GitHub PR 已合并且 HEAD 完全相同，重新检查未提交内容、子模块、未推送提交、打开文件和 Codex 会话。锁定、嵌套、含 planning、状态未知的工作树会保留。Pinned 会话始终保护相关目录，最近 7 天的未归档会话也保护相关目录。无关目录的会话不锁住整盘；会话后来跨目录访问的行为无法只凭 cwd 推断，程序同时检查当时打开的文件。
+
+Git 忽略的内容也会检查。自动删除只放行 `node_modules`、`target`、`.next`、`.turbo`、`.venv`、`venv`、`__pycache__`、`Pods`、`.gradle`、`DerivedData`、`build`、`dist`、`.artifacts` 这些可重建目录和 `.DS_Store`。其他 ignored 文件或目录，例如 `.env.local`、`.cursor` 配置和本地数据，会阻止回收并记入报告。此保护不改变手动 `wtrm delete` 的行为。
+
+缓存按仓库合计主检出和附加工作树的 `.turbo/cache`。软上限是 5 GiB。超过上限时，按修改时间淘汰超过 24 小时、未被打开的完整 hash 组，包括归档、meta 和 manifest。近期或被占用的组可以让缓存暂时超过上限，报告会显示剩余超限量。未知文件保留。
+
+缓存发现包括扫描根本身、wtrm 已发现的仓库，以及根目录下最多 8 层的主仓库，即使它没有附加工作树。发现过程跳过依赖和构建目录，找到仓库后不再进入其内部，最多检查 10 万个条目。
+
+构建私有二进制后安装。`--volume-uuid` 使用 `diskutil info` 显示的卷 UUID，`--report-dir` 指向本任务 planning 的 `evidence/maintenance` 绝对路径。
+
+```bash
+CARGO_TARGET_DIR=.artifacts/target cargo build --locked --release
+python3 scripts/install-reclaim-space.py \
+  --wtrm "$PWD/.artifacts/target/release/wtrm" \
+  --root /Volumes/ssd/project --mount /Volumes/ssd \
+  --volume-uuid EXTERNAL-VOLUME-UUID \
+  --report-dir /absolute/task-planning/evidence/maintenance
+```
+
+安装器写入 `~/.local/lib/wtrm-maintenance` 和 `~/Library/LaunchAgents/com.wtrm.maintenance.plist`，不覆盖现有 `wtrm`，也不加载任务。先运行安装器输出的 dry-run 命令，检查报告后再启用：
+
+```bash
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.wtrm.maintenance.plist"
+launchctl kickstart "gui/$(id -u)/com.wtrm.maintenance"
+```
+
+定时任务以私有 `wtrm maintain --config <path> --apply` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。不带 `--apply` 时只读。这样维护程序使用自己的原生授权入口，外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。
+
+任务每小时运行，使用单实例锁，仅保留最近 20 份报告。外置盘身份不匹配、活动探测失败或 GitHub 状态无法确认时保留数据。文件和进程检查不能原子锁住随后启动的其他程序，程序会在删除前复核身份；不要把它当作并发写入锁。
+
+停用定时任务：
+
+```bash
+launchctl bootout "gui/$(id -u)/com.wtrm.maintenance"
+```
 
 ## 交互
 
