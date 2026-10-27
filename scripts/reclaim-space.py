@@ -113,9 +113,10 @@ class Config:
         if not below(self.root, self.mount) or self.root == self.mount:
             raise Unsafe("project root must be inside the mounted volume")
         data = plistlib.loads(command(["diskutil", "info", "-plist", str(self.mount)]).stdout)
-        if (data.get("VolumeUUID", "").lower() != self.volume_uuid.lower()
+        volume_uuid = data.get("VolumeUUID")
+        if (not isinstance(volume_uuid, str) or volume_uuid.lower() != self.volume_uuid.lower()
                 or data.get("MountPoint") != str(self.mount)
-                or not data.get("Mounted", False)):
+                or data.get("Writable") is not True):
             raise Unsafe("mounted volume identity does not match configuration")
         self.device = self.mount.stat().st_dev
         self.bound(self.root)

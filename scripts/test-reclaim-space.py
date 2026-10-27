@@ -53,6 +53,8 @@ class MaintenanceTests(unittest.TestCase):
         self.open_paths = []
         self.lsof_bad = False
         self.uuid = "TEST-UUID"
+        self.mount_point = str(self.mount)
+        self.writable = True
         self.pr_state = "MERGED"
         self.command_patch = patch.object(M, "command", side_effect=self.fake_command)
         self.command_patch.start()
@@ -69,7 +71,10 @@ class MaintenanceTests(unittest.TestCase):
 
     def fake_command(self, args, check=True):
         if args[0] == "diskutil":
-            data = plistlib.dumps({"VolumeUUID": self.uuid, "MountPoint": str(self.mount), "Mounted": True})
+            fields = {"VolumeUUID": self.uuid, "Writable": self.writable, "Internal": False}
+            if self.mount_point is not None:
+                fields["MountPoint"] = self.mount_point
+            data = plistlib.dumps(fields)
             return subprocess.CompletedProcess(args, 0, data, b"")
         if args[0] == "lsof":
             if self.lsof_bad:
@@ -248,6 +253,16 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertTrue(self.linked.exists())
 
+    def test_unmounted_and_read_only_volumes_are_rejected(self):
+        for mount_point, writable in ((None, True), (str(self.mount) + "-other", True),
+                                      (str(self.mount), False), (str(self.mount), "true")):
+            with self.subTest(mount_point=mount_point, writable=writable):
+                self.mount_point, self.writable = mount_point, writable
+                result = self.run_maintenance(True)
+                self.assertEqual(result["status"], "error", result)
+                self.assertTrue(self.linked.exists())
+                self.assertEqual((self.linked / "source.txt").read_text(), "source\n")
+
     def test_unrelated_session_does_not_block_worktrees(self):
         with sqlite3.connect(self.database) as db:
             db.execute("INSERT INTO threads VALUES (?,?,?,?,?)", (str(self.base / "home"), 0, 0, self.now, self.now))
@@ -269,7 +284,8 @@ class MaintenanceTests(unittest.TestCase):
         commands = self.base / "commands"
         commands.mkdir()
         diskutil = commands / "diskutil"
-        payload = {"VolumeUUID": "TEST-UUID", "MountPoint": str(self.mount), "Mounted": True}
+        payload = {"VolumeUUID": "TEST-UUID", "MountPoint": str(self.mount),
+                   "Writable": True, "Internal": False}
         diskutil.write_text("#!" + sys.executable + "\nimport plistlib,sys\nsys.stdout.buffer.write(plistlib.dumps(" + repr(payload) + "))\n")
         diskutil.chmod(0o700)
         install = home / "private-maintenance"
