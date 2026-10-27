@@ -109,6 +109,10 @@ struct DeleteArgs {
     /// Also delete the branch: keep, local, or github
     #[arg(long, default_value = "keep", value_parser = parse_branches)]
     branches: BranchScope,
+
+    /// Refuse deletion unless this single worktree still has the given commit
+    #[arg(long)]
+    expected_head: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -185,6 +189,14 @@ fn run_plan(cli: &Cli) -> anyhow::Result<()> {
 
 fn run_delete(cli: &Cli, args: &DeleteArgs) -> anyhow::Result<()> {
     require_targets(&args.path, &args.id)?;
+    if let Some(head) = &args.expected_head {
+        if args.path.len() + args.id.len() != 1 || args.force {
+            bail!("--expected-head requires one target and cannot be used with --force");
+        }
+        if !matches!(head.len(), 40 | 64) || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("--expected-head requires a full commit hash");
+        }
+    }
     let execute = args.yes && !args.dry_run;
     let (roots, result, ms) = load_scan_with_targets(cli, &args.path)?;
     let items = ops::delete_targets(
@@ -194,6 +206,7 @@ fn run_delete(cli: &Cli, args: &DeleteArgs) -> anyhow::Result<()> {
         execute,
         args.force,
         args.branches,
+        args.expected_head.as_deref(),
     );
     let report = Report::from_scan(&roots, result)
         .with_scan_ms(ms)
