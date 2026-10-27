@@ -82,6 +82,19 @@ enum Command {
     Delete(DeleteArgs),
     /// Remove dependency directories by --path or --id (dry-run unless --yes)
     Clean(CleanArgs),
+    /// Run the adjacent maintenance program (dry-run unless --apply)
+    Maintain(MaintainArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct MaintainArgs {
+    /// Maintenance configuration file
+    #[arg(long)]
+    config: PathBuf,
+
+    /// Execute instead of dry-run
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -140,8 +153,51 @@ pub fn run() -> anyhow::Result<()> {
         Some(Command::Plan) => run_plan(&cli),
         Some(Command::Delete(args)) => run_delete(&cli, args),
         Some(Command::Clean(args)) => run_clean(&cli, args),
+        Some(Command::Maintain(args)) => run_maintenance(args),
         None => run_scan_or_tui(&cli),
     }
+}
+
+fn run_maintenance(args: &MaintainArgs) -> anyhow::Result<()> {
+    let executable = std::env::current_exe().context("cannot locate wtrm executable")?;
+    let directory = executable
+        .parent()
+        .context("wtrm executable has no parent directory")?;
+    let directory_metadata = std::fs::symlink_metadata(directory)?;
+    if !directory_metadata.file_type().is_dir() {
+        bail!("maintenance directory must be a regular directory");
+    }
+    let script = directory.join("reclaim-space.py");
+    let metadata =
+        std::fs::symlink_metadata(&script).context("maintenance script is missing next to wtrm")?;
+    if !metadata.file_type().is_file() {
+        bail!("maintenance script must be a regular file next to wtrm");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if directory_metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            bail!("maintenance directory and script must not be writable by other users");
+        }
+    }
+    let mut command = std::process::Command::new("/usr/bin/python3");
+    command
+        .arg("-I")
+        .arg(script)
+        .arg("--config")
+        .arg(&args.config);
+    if args.apply {
+        command.arg("--apply");
+    }
+    let status = command
+        .status()
+        .context("cannot start maintenance program")?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 fn run_scan_or_tui(cli: &Cli) -> anyhow::Result<()> {

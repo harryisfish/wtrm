@@ -110,6 +110,8 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.wtrm.maintena
 launchctl kickstart "gui/$(id -u)/com.wtrm.maintenance"
 ```
 
+定时任务以私有 `wtrm maintain --config <path> --apply` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。不带 `--apply` 时只读。这样维护程序使用自己的原生授权入口，外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。
+
 任务每小时运行，使用单实例锁，仅保留最近 20 份报告。外置盘身份不匹配、活动探测失败或 GitHub 状态无法确认时保留数据。文件和进程检查不能原子锁住随后启动的其他程序，程序会在删除前复核身份；不要把它当作并发写入锁。
 
 停用定时任务：

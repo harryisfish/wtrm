@@ -53,6 +53,7 @@ def main():
                                capture_output=True, text=True).stdout
     if "--expected-head" not in help_text:
         raise MAINTENANCE.Unsafe("wtrm binary lacks --expected-head")
+    subprocess.run([str(binary), "maintain", "--help"], check=True, capture_output=True)
     config = MAINTENANCE.Config(args.root, args.mount, args.volume_uuid, binary,
                                 args.codex_db, args.report_dir)
     config.validate_volume()
@@ -70,8 +71,7 @@ def main():
     replace_file(config_path, (json.dumps(data, indent=2) + "\n").encode(), 0o600)
     agent = Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
     plist = {"Label": LABEL,
-             "ProgramArguments": ["/usr/bin/python3", str(installed_script), "--config",
-                                  str(config_path), "--apply"],
+             "ProgramArguments": [str(installed_binary), "maintain", "--config", str(config_path), "--apply"],
              "StartInterval": 3600, "RunAtLoad": False, "ProcessType": "Background",
              "LowPriorityIO": True, "Nice": 10,
              "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
@@ -79,7 +79,7 @@ def main():
     replace_file(agent, plistlib.dumps(plist), 0o600)
     print(json.dumps({"installed": str(install), "config": str(config_path),
                       "launch_agent": str(agent), "loaded": False,
-                      "dry_run": ["/usr/bin/python3", str(installed_script), "--config", str(config_path)]},
+                      "dry_run": [str(installed_binary), "maintain", "--config", str(config_path)]},
                      indent=2))
 
 

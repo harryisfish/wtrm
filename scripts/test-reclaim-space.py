@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -303,7 +304,55 @@ class MaintenanceTests(unittest.TestCase):
         agent = plistlib.loads(Path(installed["launch_agent"]).read_bytes())
         self.assertFalse(agent["RunAtLoad"])
         self.assertEqual(agent["StartInterval"], 3600)
-        self.assertEqual(agent["ProgramArguments"][-1], "--apply")
+        native_entry = [str(install / "wtrm"), "maintain", "--config", str(install / "config.json")]
+        self.assertEqual(installed["dry_run"], native_entry)
+        self.assertEqual(agent["ProgramArguments"], native_entry + ["--apply"])
+
+    def test_native_maintenance_entry_waits_and_forwards_only_fixed_arguments(self):
+        private = self.base / "native entry"
+        private.mkdir()
+        binary = private / "wtrm"
+        shutil.copy2(BINARY, binary)
+        config = private / "config with spaces.json"
+        (private / "reclaim-space.py").write_text(
+            "import json,os,sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[2]).write_text(json.dumps({'args':sys.argv[1:],'parent':os.getppid(),'isolated':sys.flags.isolated}))\n"
+            "raise SystemExit(7 if '--apply' in sys.argv else 0)\n")
+        args = [str(binary), "maintain", "--config", str(config)]
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, error = process.communicate()
+        self.assertEqual(process.returncode, 0, error)
+        observed = json.loads(config.read_text())
+        self.assertEqual(observed["args"], ["--config", str(config)])
+        self.assertEqual(observed["parent"], process.pid)
+        self.assertEqual(observed["isolated"], 1)
+        result = subprocess.run(args + ["--apply"], capture_output=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(json.loads(config.read_text())["args"], ["--config", str(config), "--apply"])
+        config.unlink()
+        result = subprocess.run(args + ["--script", str(PROJECT / "scripts/reclaim-space.py")], capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(config.exists())
+        (private / "reclaim-space.py").unlink()
+        result = subprocess.run(args, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"missing next to wtrm", result.stderr)
+        self.assertFalse(config.exists())
+        outside = self.base / "outside-script.py"
+        outside.write_text("raise SystemExit('must not execute')\n")
+        (private / "reclaim-space.py").symlink_to(outside)
+        result = subprocess.run(args, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"regular file next to wtrm", result.stderr)
+        (private / "reclaim-space.py").unlink()
+        (private / "reclaim-space.py").write_text("raise SystemExit(0)\n")
+        private.chmod(0o777)
+        try:
+            result = subprocess.run(args, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"must not be writable by other users", result.stderr)
+        finally:
+            private.chmod(0o700)
 
     def test_cache_groups_dry_run_and_main_only_repository(self):
         self.git(self.repo, "worktree", "remove", str(self.linked))
