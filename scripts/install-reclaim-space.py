@@ -53,7 +53,7 @@ def main():
                                capture_output=True, text=True).stdout
     if "--expected-head" not in help_text:
         raise MAINTENANCE.Unsafe("wtrm binary lacks --expected-head")
-    subprocess.run([str(binary), "maintain", "--help"], check=True, capture_output=True)
+    subprocess.run([str(binary), "help", "maintain"], check=True, capture_output=True)
     config = MAINTENANCE.Config(args.root, args.mount, args.volume_uuid, binary,
                                 args.codex_db, args.report_dir)
     config.validate_volume()

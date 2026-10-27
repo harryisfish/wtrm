@@ -308,6 +308,36 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(installed["dry_run"], native_entry)
         self.assertEqual(agent["ProgramArguments"], native_entry + ["--apply"])
 
+    def test_installer_rejects_old_binary_before_writing_files(self):
+        home = self.base / "old-binary-home"
+        home.mkdir()
+        commands = self.base / "old-binary-commands"
+        commands.mkdir()
+        old = commands / "old-wtrm"
+        old.write_text(
+            "#!" + sys.executable + "\nimport sys\n"
+            "args=sys.argv[1:]\n"
+            "if args == ['delete','--help']: print('--expected-head')\n"
+            "elif args == ['maintain','--help']: print('top-level help')\n"
+            "else: raise SystemExit(2)\n")
+        old.chmod(0o700)
+        diskutil = commands / "diskutil"
+        payload = {"VolumeUUID": "TEST-UUID", "MountPoint": str(self.mount),
+                   "Writable": True, "Internal": False}
+        diskutil.write_text("#!" + sys.executable + "\nimport plistlib,sys\nsys.stdout.buffer.write(plistlib.dumps(" + repr(payload) + "))\n")
+        diskutil.chmod(0o700)
+        install = home / "private-maintenance"
+        args = [sys.executable, str(PROJECT / "scripts/install-reclaim-space.py"),
+                "--wtrm", str(old), "--root", str(self.root), "--mount", str(self.mount),
+                "--volume-uuid", "TEST-UUID", "--report-dir", str(self.config.report_dir),
+                "--codex-db", str(self.database), "--install-dir", str(install)]
+        env = dict(os.environ, HOME=str(home), PATH=str(commands) + os.pathsep + os.environ["PATH"])
+        result = subprocess.run(args, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(install.exists())
+        self.assertFalse(self.config.report_dir.exists())
+        self.assertFalse((home / "Library/LaunchAgents/com.wtrm.maintenance.plist").exists())
+
     def test_native_maintenance_entry_waits_and_forwards_only_fixed_arguments(self):
         private = self.base / "native entry"
         private.mkdir()
