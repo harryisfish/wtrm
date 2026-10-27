@@ -86,7 +86,11 @@ JSON 顶层固定为：
 
 工作树必须创建满 7 天。程序检查 GitHub PR 已合并且 HEAD 完全相同，重新检查未提交内容、子模块、未推送提交、打开文件和 Codex 会话。锁定、嵌套、含 planning、状态未知的工作树会保留。Pinned 会话始终保护相关目录，最近 7 天的未归档会话也保护相关目录。无关目录的会话不锁住整盘；会话后来跨目录访问的行为无法只凭 cwd 推断，程序同时检查当时打开的文件。
 
+Git 忽略的内容也会检查。自动删除只放行 `node_modules`、`target`、`.next`、`.turbo`、`.venv`、`venv`、`__pycache__`、`Pods`、`.gradle`、`DerivedData`、`build`、`dist`、`.artifacts` 这些可重建目录和 `.DS_Store`。其他 ignored 文件或目录，例如 `.env.local`、`.cursor` 配置和本地数据，会阻止回收并记入报告。此保护不改变手动 `wtrm delete` 的行为。
+
 缓存按仓库合计主检出和附加工作树的 `.turbo/cache`。软上限是 5 GiB。超过上限时，按修改时间淘汰超过 24 小时、未被打开的完整 hash 组，包括归档、meta 和 manifest。近期或被占用的组可以让缓存暂时超过上限，报告会显示剩余超限量。未知文件保留。
+
+缓存发现包括扫描根本身、wtrm 已发现的仓库，以及根目录下最多 8 层的主仓库，即使它没有附加工作树。发现过程跳过依赖和构建目录，找到仓库后不再进入其内部，最多检查 10 万个条目。
 
 构建私有二进制后安装。`--volume-uuid` 使用 `diskutil info` 显示的卷 UUID，`--report-dir` 指向本任务 planning 的 `evidence/maintenance` 绝对路径。
 

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Exercise maintenance against disposable Git repositories and cache files."""
-
 import fcntl
 import importlib.util
 import json
@@ -95,8 +93,8 @@ class MaintenanceTests(unittest.TestCase):
     def target_result(self, result):
         return next(row for row in result["worktrees"] if row.get("path") == str(self.linked))
 
-    def cache_group(self, key, age=2 * 86400):
-        directory = self.repo / ".turbo/cache"
+    def cache_group(self, key, age=2 * 86400, repo=None):
+        directory = (self.repo if repo is None else repo) / ".turbo/cache"
         directory.mkdir(parents=True, exist_ok=True)
         paths = [directory / (key + suffix) for suffix in (".tar.zst", "-meta.json", "-manifest.json")]
         for path in paths:
@@ -139,6 +137,64 @@ class MaintenanceTests(unittest.TestCase):
         result = self.run_maintenance(True)
         self.assertIn("unpushed", self.target_result(result)["reason"])
         self.assertTrue(self.linked.exists())
+
+    def ignore(self, pattern):
+        with (self.repo / ".git/info/exclude").open("a") as handle:
+            handle.write("\n" + pattern + "\n")
+
+    def test_ignored_local_file_is_preserved_in_dry_run_and_apply(self):
+        self.ignore(".env.local")
+        local = self.linked / ".env.local"
+        content = b"UNIQUE_LOCAL_SETTING=fixture-only\n"
+        local.write_bytes(content)
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                result = self.run_maintenance(apply)
+                item = self.target_result(result)
+                self.assertEqual(item["action"], "skip", item)
+                self.assertIn("ignored local content: .env.local", item["reason"])
+                self.assertEqual(local.read_bytes(), content)
+
+    def test_unknown_ignored_directory_is_preserved(self):
+        self.ignore("private-data/")
+        directory = self.linked / "private-data"
+        directory.mkdir()
+        local = directory / "notes.db"
+        content = b"unique local data\x00"
+        local.write_bytes(content)
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                result = self.run_maintenance(apply)
+                item = self.target_result(result)
+                self.assertEqual(item["action"], "skip", item)
+                self.assertIn("private-data/", item["reason"])
+                self.assertEqual(local.read_bytes(), content)
+
+    def test_allowed_ignored_cache_does_not_block_worktree_removal(self):
+        cache = self.linked / "node_modules/package/cache.bin"
+        cache.parent.mkdir(parents=True)
+        cache.write_bytes(b"rebuildable cache")
+        result = self.run_maintenance(True)
+        self.assertEqual(self.target_result(result)["action"], "removed", result)
+        self.assertFalse(self.linked.exists())
+        self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
+
+    def test_ignored_local_file_created_after_initial_check_is_preserved(self):
+        self.ignore(".env.local")
+        local = self.linked / ".env.local"
+        content = b"created during observation\n"
+        capture = M.Activity.capture
+
+        def create_local(config):
+            activity = capture(config)
+            local.write_bytes(content)
+            return activity
+
+        with patch.object(M.Activity, "capture", side_effect=create_local):
+            result = self.run_maintenance(True)
+        self.assertEqual(self.target_result(result)["action"], "skip", result)
+        self.assertIn("ignored local content", self.target_result(result)["reason"])
+        self.assertEqual(local.read_bytes(), content)
 
     def test_dirty_submodule_is_preserved(self):
         source = self.base / "dependency"
@@ -245,6 +301,39 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in older))
         self.assertTrue(all(path.exists() for path in newer))
         self.assertEqual(result["caches"][0]["protected_over_limit"], 0)
+
+    def test_nested_main_only_repository_cache_is_reclaimed(self):
+        nested = self.root / "group/nested"
+        nested.parent.mkdir()
+        self.git(self.root, "init", "-b", "main", str(nested))
+        older = self.cache_group("a" * 16, 3 * 86400, nested)
+        newer = self.cache_group("b" * 16, 2 * 86400, nested)
+        with patch.object(M, "CACHE_LIMIT", 30000):
+            result = self.run_maintenance(True)
+        cache = next(row for row in result["caches"] if row["repo"] == str(nested))
+        self.assertGreater(cache["removed_bytes"], 0)
+        self.assertTrue(all(not path.exists() for path in older))
+        self.assertTrue(all(path.exists() for path in newer))
+
+    def test_scanned_nested_repository_and_linked_cache_are_discovered(self):
+        nested = self.repo / "embedded"
+        self.git(self.repo, "init", "-b", "main", str(nested))
+        self.git(nested, "commit", "--allow-empty", "-m", "nested")
+        linked = nested / ".worktrees/worker"
+        self.git(nested, "worktree", "add", "-b", "worker", str(linked))
+        self.cache_group("a" * 16, repo=nested)
+        self.cache_group("b" * 16, repo=linked)
+        rows = json.loads(self.original_command([str(BINARY), "--json", str(nested)]).stdout)["worktrees"]
+        self.config.validate_volume()
+        found = M.repository_caches(self.config, rows)
+        self.assertEqual(set(found[nested]), {nested / ".turbo/cache", linked / ".turbo/cache"})
+
+    def test_scan_root_itself_can_be_a_main_only_repository(self):
+        self.git(self.repo, "worktree", "remove", str(self.linked))
+        self.cache_group("a" * 16)
+        self.config.root = self.repo
+        self.config.validate_volume()
+        self.assertEqual(M.repository_caches(self.config, []), {self.repo: [self.repo / ".turbo/cache"]})
 
     def test_recent_open_and_linked_cache_members_protect_groups(self):
         old = self.cache_group("a" * 16)

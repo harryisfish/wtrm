@@ -24,6 +24,10 @@ CACHE_LIMIT = 5 * 1024 ** 3
 REPORT_LIMIT = 20
 TREE_ENTRY_LIMIT = 100000
 CACHE_NAME = re.compile(r"([a-f0-9]{16,64})(?:\.tar\.zst|-meta\.json|-manifest\.json)$")
+REBUILDABLE_DIRS = frozenset((
+    "node_modules", "target", ".next", ".turbo", ".venv", "venv", "__pycache__",
+    "Pods", ".gradle", "DerivedData", "build", "dist", ".artifacts",
+))
 
 
 class Unsafe(RuntimeError):
@@ -266,12 +270,31 @@ def clean_head(path, branch, head):
     if git(path, "status", "--porcelain=v1", "-z", "--untracked-files=normal",
            "--ignore-submodules=none").stdout:
         raise Unsafe("worktree has uncommitted content")
+    check_ignored_content(path)
     upstream = git(path, "rev-parse", "--verify", "@{upstream}", check=False)
     if not upstream.returncode:
         if int(text(git(path, "rev-list", "--count", "@{upstream}..HEAD"))):
             raise Unsafe("worktree has unpushed commits")
     elif upstream.returncode != 128:
         raise Unsafe("cannot determine upstream")
+
+
+def check_ignored_content(path):
+    output = git(path, "ls-files", "--others", "--ignored", "--exclude-standard",
+                 "--directory", "--no-empty-directory", "-z").stdout
+    if output and not output.endswith(b"\0"):
+        raise Unsafe("cannot parse ignored worktree content")
+    for raw in output.split(b"\0")[:-1]:
+        name = os.fsdecode(raw)
+        parts = name.rstrip("/").split("/")
+        if not name or name.startswith("/") or any(part in ("", ".", "..") for part in parts):
+            raise Unsafe("invalid ignored worktree path")
+        directories = parts if name.endswith("/") else parts[:-1]
+        if any(part in REBUILDABLE_DIRS for part in directories):
+            continue
+        if not name.endswith("/") and parts[-1] == ".DS_Store":
+            continue
+        raise Unsafe("worktree contains ignored local content: " + name)
 
 
 def check_contents(path):
@@ -355,28 +378,61 @@ def reclaim_worktrees(config, worktrees, now, apply):
 
 
 def repository_caches(config, worktrees):
-    repositories = {}
-    with os.scandir(config.root) as entries:
-        for entry in entries:
-            if "trash" in entry.name.lower() or not entry.is_dir(follow_symlinks=False):
-                continue
-            path = Path(entry.path)
-            if not (path / ".git").exists():
-                continue
-            try:
-                config.bound(path)
-                safe_path(path / ".git")
-                config.bound(text(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")))
-                if Path(text(git(path, "rev-parse", "--show-toplevel"))) != path:
-                    continue
-                repositories[path] = {path}
-            except (Unsafe, OSError):
-                continue
+    repositories, commons = {}, {}
+
+    def checkout(path):
+        path = config.bound(path)
+        marker = path / ".git"
+        if not os.path.lexists(marker):
+            return None
+        safe_path(marker)
+        if Path(text(git(path, "rev-parse", "--show-toplevel"))) != path:
+            raise Unsafe("Git top-level does not match checkout")
+        return config.bound(text(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")))
+
+    def add_repository(path):
+        path = Path(path)
+        if path in repositories:
+            return True
+        common = checkout(path)
+        if common is None:
+            return False
+        commons[path] = common
+        repositories[path] = {path}
+        return True
+
     for row in worktrees:
         try:
-            repo = config.bound(row["repo_root"])
+            add_repository(row["repo_root"])
+        except (Unsafe, OSError, KeyError):
+            continue
+
+    skipped = REBUILDABLE_DIRS | {".git", ".worktrees", ".pnpm-store", ".cache", ".npm", ".cargo", ".rustup"}
+    stack, seen, count = [(config.root, 0)], set(), 0
+    while stack:
+        path, depth = stack.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            if add_repository(path) or depth >= 8:
+                continue
+        except (Unsafe, OSError):
+            continue
+        with open_directory(path) as fd, os.scandir(fd) as entries:
+            for entry in entries:
+                count += 1
+                if count > TREE_ENTRY_LIMIT:
+                    raise Unsafe("repository discovery exceeded its bound")
+                if "trash" in entry.name.lower() or entry.name in skipped:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append((path / entry.name, depth + 1))
+    for row in worktrees:
+        try:
+            repo = Path(row["repo_root"])
             path = config.bound(row["path"])
-            if repo in repositories:
+            if repo in repositories and checkout(path) == commons[repo]:
                 repositories[repo].add(path)
         except (Unsafe, OSError, KeyError):
             continue
