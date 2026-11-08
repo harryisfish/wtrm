@@ -613,7 +613,15 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
         if !event::poll(wait)? {
             continue;
         }
-        while let Event::Key(key) = event::read()? {
+        loop {
+            let key = match event::read()? {
+                Event::Key(key) => key,
+                Event::Resize(_, _) => {
+                    need_draw = true;
+                    break;
+                }
+                _ => break,
+            };
             if key.kind == KeyEventKind::Release {
                 if !event::poll(Duration::ZERO)? {
                     break;
@@ -744,9 +752,10 @@ fn draw(frame: &mut Frame, app: &App) {
     let foot_h = match app.pending {
         Pending::None if app.scanning() && app.items.is_empty() => 4 + extra,
         Pending::None if app.filter_mode => 7 + extra,
-        Pending::None => 9 + extra,
+        Pending::None => 11 + extra,
         _ => 14,
-    };
+    }
+    .min(frame.area().height.saturating_sub(5));
     let chunks =
         Layout::vertical([Constraint::Min(3), Constraint::Length(foot_h)]).split(frame.area());
     draw_table(frame, app, chunks[0]);
@@ -761,7 +770,7 @@ struct ColumnSpec {
 }
 
 fn column_spec(width: u16) -> ColumnSpec {
-    if width >= 110 {
+    if width >= 120 {
         ColumnSpec {
             headers: vec![
                 "", "id", "active", "repo", "branch", "folder", "status", "path",
@@ -785,10 +794,10 @@ fn column_spec(width: u16) -> ColumnSpec {
             widths: vec![
                 Constraint::Length(2),
                 Constraint::Length(8),
-                Constraint::Length(14),
-                Constraint::Length(16),
+                Constraint::Length(if width < 80 { 8 } else { 14 }),
+                Constraint::Length(if width < 80 { 10 } else { 16 }),
                 Constraint::Length(6),
-                Constraint::Min(18),
+                Constraint::Min(16),
             ],
             show_folder: false,
             show_path: false,
@@ -882,7 +891,7 @@ fn row_style(wt: &Worktree, now: i64) -> Style {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let lines = match app.pending {
+    let mut lines = match app.pending {
         Pending::Delete => confirm_lines(app),
         Pending::Clean => clean_lines(app),
         Pending::None if app.filter_mode => filter_lines(app),
@@ -895,26 +904,100 @@ fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Pending::None if !app.last_result.is_empty() => " result ",
         Pending::None => " help ",
     };
-    let paragraph = Paragraph::new(lines)
-        .block(Block::bordered().title(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    let hints = match app.pending {
+        Pending::Delete => {
+            let typed = if app.confirm_buf.is_empty() {
+                "type y or delete to confirm".to_string()
+            } else {
+                format!("typed: {}_", app.confirm_buf)
+            };
+            vec![
+                Line::from("y delete clean worktrees"),
+                Line::from("f force delete dirty or locked worktrees"),
+                Line::from("b branch policy: keep → local → GitHub"),
+                Line::from(format!("{typed}    Esc cancel")),
+                Line::from("Enter does nothing"),
+            ]
+        }
+        Pending::Clean => vec![Line::from("y confirm    Esc cancel    Enter does nothing")],
+        Pending::None if app.filter_mode => vec![Line::from("Enter apply    Esc clear")],
+        Pending::None if app.scanning() && app.items.is_empty() => {
+            vec![Line::from("q quit    scanning…")]
+        }
+        Pending::None => vec![
+            Line::from("j/k move   space select   a toggle visible"),
+            Line::from("d delete   x clean deps   / filter   r refresh   q quit"),
+            Line::from("m merged   i idle   s old+idle   0 all"),
+        ],
+    };
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let browsing = app.pending == Pending::None
+        && !app.filter_mode
+        && !(app.scanning() && app.items.is_empty());
+    let sections = Layout::vertical([
+        Constraint::Length(u16::from(app.pending == Pending::None)),
+        Constraint::Length(u16::from(browsing)),
+        Constraint::Min(0),
+        Constraint::Length(hints.len() as u16),
+    ])
+    .split(inner);
+    if app.pending == Pending::None {
+        frame.render_widget(Paragraph::new(app.status_text()), sections[0]);
+    }
+    if browsing {
+        let text_filter = if app.filter.is_empty() {
+            String::new()
+        } else {
+            format!(" · text: {}", app.filter)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("filter {}{text_filter}", app.query.label()),
+                Style::new().fg(Color::DarkGray),
+            ))),
+            sections[1],
+        );
+    }
+    let detail = if browsing && !app.last_result.is_empty() {
+        lines.pop()
+    } else {
+        None
+    };
+    let body = if let Some(detail) = detail {
+        let parts =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(sections[2]);
+        frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), parts[0]);
+        parts[1]
+    } else {
+        sections[2]
+    };
+    let paragraph = if app.pending == Pending::None && app.filter_mode {
+        let hidden = lines[0].width().saturating_sub(body.width as usize);
+        let mut scroll = 0;
+        // A partially clipped wide grapheme can push the caret out of view.
+        for grapheme in lines[0].styled_graphemes(Style::new()) {
+            if scroll >= hidden {
+                break;
+            }
+            scroll += Line::from(grapheme.symbol).width();
+        }
+        Paragraph::new(lines).scroll((0, scroll.min(u16::MAX as usize) as u16))
+    } else {
+        Paragraph::new(lines).wrap(Wrap { trim: false })
+    };
+    frame.render_widget(paragraph, body);
+    frame.render_widget(Paragraph::new(hints), sections[3]);
 }
 
 fn filter_lines(app: &App) -> Vec<Line<'static>> {
-    vec![
-        Line::from(format!("filter: {}_", app.filter)),
-        Line::from("Enter apply    Esc clear"),
-        Line::from(app.status_text()),
-    ]
+    vec![Line::from(format!("filter: {}_", app.filter))]
 }
 
 fn browse_lines(app: &App) -> Vec<Line<'static>> {
     if app.scanning() && app.items.is_empty() {
-        return vec![
-            Line::from(app.status_text()),
-            Line::from("q quit    scanning…"),
-        ];
+        return Vec::new();
     }
     let detail = match app
         .visible()
@@ -938,26 +1021,21 @@ fn browse_lines(app: &App) -> Vec<Line<'static>> {
                 wt.flags()
             )
         }
-        None => "no repos with linked worktrees".to_string(),
+        None if app.items.is_empty() => "no repos with linked worktrees".to_string(),
+        None => "no worktrees match the current filters".to_string(),
     };
     let mut lines = vec![
-        Line::from(detail),
         Line::from(Span::styled(
-            format!(
-                "filter {}. merged means the commit is in the local default branch. squash merges are not detected.",
-                app.query.label()
-            ),
+            "merged means the commit is in the local default branch.",
             Style::new().fg(Color::DarkGray),
         )),
-        Line::from(app.status_text()),
+        Line::from(Span::styled(
+            "squash merges are not detected.",
+            Style::new().fg(Color::DarkGray),
+        )),
     ];
     lines.extend(result_lines(app));
-    lines.push(Line::from(
-        "m merged   i idle   s old+idle   0 all   x clean deps",
-    ));
-    lines.push(Line::from(
-        "j/k move   space select   a toggle visible   d delete   / filter   r refresh   q quit",
-    ));
+    lines.push(Line::from(detail));
     lines
 }
 
@@ -985,7 +1063,6 @@ fn clean_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(
             "removes node_modules, target, .next, .turbo, .venv, venv, __pycache__, Pods, .gradle.",
         ),
-        Line::from("y confirm    Esc cancel    Enter does nothing"),
     ];
     if !app.confirm_hint.is_empty() {
         lines.push(Line::from(app.confirm_hint.clone()));
@@ -1013,18 +1090,9 @@ fn selected_worktrees(app: &App) -> Vec<&Worktree> {
 
 fn confirm_lines(app: &App) -> Vec<Line<'static>> {
     let chosen = selected_worktrees(app);
-    let typed = if app.confirm_buf.is_empty() {
-        "type y or delete to confirm".to_string()
-    } else {
-        format!("typed: {}_", app.confirm_buf)
-    };
     let mut lines = vec![
         Line::from(format!("delete {} worktrees", chosen.len())),
         Line::from(format!("branch policy: {}", app.branch_scope.label())),
-        Line::from("y delete clean worktrees"),
-        Line::from("f force delete dirty or locked worktrees"),
-        Line::from("b branch policy: keep → local → GitHub"),
-        Line::from(format!("{typed}    Esc cancel    Enter does nothing")),
     ];
     if !app.confirm_hint.is_empty() {
         lines.push(Line::from(app.confirm_hint.clone()));
@@ -1048,6 +1116,8 @@ fn confirm_lines(app: &App) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use crate::scan::fixture;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn app_with(items: Vec<Worktree>) -> App {
         App::from_scan(
@@ -1058,6 +1128,245 @@ mod tests {
             },
             "~/project".to_string(),
         )
+    }
+
+    fn render(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| {
+                let mut line = String::new();
+                let mut skip = 0;
+                for cell in row {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    line.push_str(cell.symbol());
+                    skip = Line::from(cell.symbol()).width().saturating_sub(1);
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn long_path_app() -> App {
+        app_with(vec![
+            fixture("/repos/demo", "demo", true, Some(10)),
+            fixture(
+                &format!("/repos/{}/feature", "long-directory/".repeat(24)),
+                "demo",
+                false,
+                Some(10),
+            ),
+        ])
+    }
+
+    #[test]
+    fn browsing_keeps_all_shortcuts_visible_with_long_details() {
+        let mut app = long_path_app();
+        app.items[1].dirty = Some(true);
+        app.items[1].locked = true;
+        app.items[1].merged = Some(true);
+        app.query.merged_only = true;
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        for (width, height) in [(120, 30), (80, 24), (60, 18)] {
+            let screen = render(&app, width, height);
+            for hint in [
+                "j/k move",
+                "space select",
+                "a toggle visible",
+                "d delete",
+                "x clean deps",
+                "/ filter",
+                "r refresh",
+                "q quit",
+                "m merged",
+                "i idle",
+                "s old+idle",
+                "0 all",
+                "filter merged",
+                "merged means the commit is in the local default branch.",
+                "squash merges are not detected.",
+            ] {
+                assert!(
+                    screen.contains(hint),
+                    "{width}x{height} missing {hint}:\n{screen}"
+                );
+            }
+            assert!(screen.contains(&app.items[1].id), "{screen}");
+            assert!(screen.contains("[dirty] [locked]"), "{screen}");
+            assert!(screen.contains("scanned ~/project"), "{screen}");
+            let header = screen.lines().nth(1).unwrap();
+            assert_eq!(header.contains("folder"), width >= 120, "{screen}");
+            assert_eq!(header.contains("path"), width >= 120, "{screen}");
+        }
+    }
+
+    #[test]
+    fn empty_and_filter_states_keep_their_recovery_keys_visible() {
+        for (width, height) in [(120, 30), (80, 24), (60, 18)] {
+            let mut app = app_with(Vec::new());
+            let screen = render(&app, width, height);
+            assert!(
+                screen.contains("no repos with linked worktrees"),
+                "{screen}"
+            );
+            assert!(screen.contains("r refresh"), "{screen}");
+            assert_eq!(
+                app.on_key(KeyCode::Char('r'), KeyModifiers::NONE),
+                Action::Rescan
+            );
+
+            app.op = OperationStatus::Running {
+                action: ActionKind::Scan,
+                total: 0,
+            };
+            app.note = "scanning ~/project …".to_string();
+            let screen = render(&app, width, height);
+            assert!(screen.contains("scanning ~/project"), "{screen}");
+            assert!(screen.contains("q quit"), "{screen}");
+            assert!(
+                !screen.contains("no repos with linked worktrees"),
+                "{screen}"
+            );
+
+            let mut app = long_path_app();
+            app.filter = "no-such-worktree".to_string();
+            app.clamp_cursor();
+            let screen = render(&app, width, height);
+            assert!(
+                screen.contains("no worktrees match the current filters"),
+                "{screen}"
+            );
+            assert!(
+                !screen.contains("no repos with linked worktrees"),
+                "{screen}"
+            );
+            assert!(screen.contains("/ filter"), "{screen}");
+            assert!(screen.contains("0 all"), "{screen}");
+            assert!(screen.contains("text: no-such-worktree"), "{screen}");
+
+            app.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+            app.filter = format!("{}终点é-tail", "长过滤/".repeat(64));
+            let screen = render(&app, width, height);
+            assert!(screen.contains("终点é-tail_"), "{screen}");
+            assert!(!screen.contains('\u{fffd}'), "{screen}");
+            assert!(screen.contains("Enter apply    Esc clear"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn confirmation_keeps_safety_and_cancel_visible() {
+        let mut app = long_path_app();
+        app.items[1].dirty = Some(true);
+        app.items[1].locked = true;
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        for scope in [
+            remove::BranchScope::Keep,
+            remove::BranchScope::Local,
+            remove::BranchScope::GitHub,
+        ] {
+            assert_eq!(app.branch_scope, scope);
+            for (width, height) in [(120, 30), (80, 24), (60, 18)] {
+                let screen = render(&app, width, height);
+                for hint in [
+                    "confirm delete",
+                    "delete 1 worktrees",
+                    "y delete clean worktrees",
+                    "f force delete dirty or locked worktrees",
+                    "b branch policy: keep → local → GitHub",
+                    "type y or delete to confirm",
+                    "Esc cancel",
+                    "Enter does nothing",
+                ] {
+                    assert!(
+                        screen.contains(hint),
+                        "{width}x{height} missing {hint}:\n{screen}"
+                    );
+                }
+                assert!(
+                    screen.contains(&format!("branch policy: {}", scope.label())),
+                    "{screen}"
+                );
+            }
+            assert_eq!(
+                app.on_key(KeyCode::Char('b'), KeyModifiers::NONE),
+                Action::None
+            );
+        }
+        assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
+        assert_eq!(app.pending, Pending::Delete);
+        assert!(render(&app, 60, 18).contains("Enter does not delete"));
+        assert_eq!(app.on_key(KeyCode::Esc, KeyModifiers::NONE), Action::None);
+        assert_eq!(app.pending, Pending::None);
+
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        for (width, height) in [(120, 30), (80, 24), (60, 18)] {
+            let screen = render(&app, width, height);
+            for hint in [
+                "confirm clean",
+                "the worktrees",
+                "stay.",
+                "y confirm",
+                "Esc cancel",
+                "Enter does nothing",
+            ] {
+                assert!(
+                    screen.contains(hint),
+                    "{width}x{height} missing {hint}:\n{screen}"
+                );
+            }
+        }
+        for ch in "delete".chars() {
+            assert_eq!(
+                app.on_key(KeyCode::Char(ch), KeyModifiers::NONE),
+                Action::None
+            );
+        }
+        assert_eq!(app.pending, Pending::Clean);
+        assert_eq!(app.on_key(KeyCode::Esc, KeyModifiers::NONE), Action::None);
+        assert_eq!(app.pending, Pending::None);
+    }
+
+    #[test]
+    fn long_result_paths_do_not_hide_status_or_shortcuts() {
+        let mut app = long_path_app();
+        let wt = app.items[1].clone();
+        app.apply_mutate_result(vec![ActionItem::new(
+            "delete",
+            &wt,
+            "dirty",
+            Some("dirty".to_string()),
+            "blocked",
+        )]);
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        for (width, height) in [(120, 30), (80, 24), (60, 18)] {
+            let screen = render(&app, width, height);
+            assert!(screen.contains(&wt.id), "{screen}");
+            for hint in [
+                "finished: 0 succeeded, 1 failed",
+                "merged means the commit is in the local default branch.",
+                "squash merges are not detected.",
+                "last result:",
+                "blocked",
+                "j/k move",
+                "r refresh",
+                "q quit",
+            ] {
+                assert!(
+                    screen.contains(hint),
+                    "{width}x{height} missing {hint}:\n{screen}"
+                );
+            }
+        }
+        assert_eq!(app.items.len(), 2);
     }
 
     #[test]

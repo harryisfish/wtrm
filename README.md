@@ -26,7 +26,7 @@ wtrm
 
 活跃时间取这三者中的最新值：最近一次提交、git index 的修改时间、worktree 目录的修改时间。只列出有附加 worktree 的仓库。主检出会显示，但不能删除。
 
-启动后立刻进入界面，扫描在后台进行；空列表时只响应 `q`。扫描不走进 `node_modules` 这类依赖目录。脏工作区检测用 `git status --porcelain=v1 -unormal`，不会把未跟踪目录（例如巨大的 `node_modules`）逐文件走一遍。
+启动后立刻进入界面，扫描在后台进行；首次扫描的空列表只接受退出，扫描完成后的空列表仍可按 `r` 刷新或 `/` 过滤。扫描不走进 `node_modules` 这类依赖目录。脏工作区检测用 `git status --porcelain=v1 -unormal`，不会把未跟踪目录（例如巨大的 `node_modules`）逐文件走一遍。
 
 扫描也跳过路径中包含 `trash` 的目录，不区分大小写，已登记的工作树也遵守这个排除规则。
 
@@ -143,6 +143,8 @@ launchctl bootout "gui/$(id -u)/com.wtrm.maintenance"
 
 ## 交互
 
+列表高亮表示当前行，`●` 表示已选中，`·` 表示受保护的主检出或裸仓库。移动当前行不会改变多选结果。
+
 | 键 | 作用 |
 | --- | --- |
 | `j` / `k` | 移动 |
@@ -154,14 +156,14 @@ launchctl bootout "gui/$(id -u)/com.wtrm.maintenance"
 | `a` | 切换当前可见列表里全部可删除项（不是无条件全选） |
 | `d` | 确认删除 worktree |
 | `x` | 只清理选中 worktree 里的依赖目录 |
-| `y` 或输入 `delete` | 删除干净的 worktree；清理依赖时确认。底部显示每条 `ok`/`blocked`/`failed` |
+| `y` / `Y` 或输入 `delete` | 删除干净的 worktree；清理依赖只接受 `y` / `Y` 确认。底部显示每条 `ok`/`blocked`/`failed` |
 | `f` | 强制删除，包括脏和锁定的 |
 | `b` | 确认删除时切换分支策略：保留、只删本地、或连 GitHub 远程一起删 |
 | `/` | 按文字过滤；Enter 应用，Esc 清空 |
 | `r` | 重新扫描；失效的选择会提示 `selection pruned: N` |
 | `q` | 退出 |
 
-状态列用 `[main]`、`[dirty]`、`[clean]`、`[locked]`、`[merged]` 标记，颜色只做辅助。窄终端隐藏 folder 和 path，完整路径在选中行详情里。
+状态列用 `[main]`、`[dirty]`、`[clean]`、`[locked]`、`[merged]` 标记，颜色只做辅助。窄终端隐藏 folder 和 path，选中行详情仍显示路径；长路径可能需要放大终端才能完整查看。
 
 启动时如果同时给了 `--created-before` 和 `--inactive`，`s` 改用这两个时长。只给 `--inactive` 时，它改的是 `i`，`s` 仍是创建 30 天、空闲 7 天。只给 `--created-before` 时，`s` 的创建时长改用它，空闲仍是 7 天。
 
