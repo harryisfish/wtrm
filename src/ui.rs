@@ -891,7 +891,7 @@ fn row_style(wt: &Worktree, now: i64) -> Style {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let lines = match app.pending {
+    let mut lines = match app.pending {
         Pending::Delete => confirm_lines(app),
         Pending::Clean => clean_lines(app),
         Pending::None if app.filter_mode => filter_lines(app),
@@ -960,8 +960,21 @@ fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             sections[1],
         );
     }
+    let detail = if browsing && !app.last_result.is_empty() {
+        lines.pop()
+    } else {
+        None
+    };
+    let body = if let Some(detail) = detail {
+        let parts =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(sections[2]);
+        frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), parts[0]);
+        parts[1]
+    } else {
+        sections[2]
+    };
     let paragraph = if app.pending == Pending::None && app.filter_mode {
-        let hidden = lines[0].width().saturating_sub(sections[2].width as usize);
+        let hidden = lines[0].width().saturating_sub(body.width as usize);
         let mut scroll = 0;
         // A partially clipped wide grapheme can push the caret out of view.
         for grapheme in lines[0].styled_graphemes(Style::new()) {
@@ -974,7 +987,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         Paragraph::new(lines).wrap(Wrap { trim: false })
     };
-    frame.render_widget(paragraph, sections[2]);
+    frame.render_widget(paragraph, body);
     frame.render_widget(Paragraph::new(hints), sections[3]);
 }
 
@@ -1333,10 +1346,14 @@ mod tests {
             Some("dirty".to_string()),
             "blocked",
         )]);
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
         for (width, height) in [(120, 30), (80, 24), (60, 18)] {
             let screen = render(&app, width, height);
+            assert!(screen.contains(&wt.id), "{screen}");
             for hint in [
                 "finished: 0 succeeded, 1 failed",
+                "merged means the commit is in the local default branch.",
+                "squash merges are not detected.",
                 "last result:",
                 "blocked",
                 "j/k move",
