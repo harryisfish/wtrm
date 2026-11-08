@@ -82,7 +82,7 @@ enum Command {
     Delete(DeleteArgs),
     /// Remove dependency directories by --path or --id (dry-run unless --yes)
     Clean(CleanArgs),
-    /// Run the adjacent maintenance program (dry-run unless --apply)
+    /// Run the adjacent maintenance program (dry-run unless --yes or --apply)
     Maintain(MaintainArgs),
 }
 
@@ -93,7 +93,7 @@ struct MaintainArgs {
     config: PathBuf,
 
     /// Execute instead of dry-run
-    #[arg(long)]
+    #[arg(long, visible_alias = "yes")]
     apply: bool,
 }
 
@@ -153,12 +153,21 @@ pub fn run() -> anyhow::Result<()> {
         Some(Command::Plan) => run_plan(&cli),
         Some(Command::Delete(args)) => run_delete(&cli, args),
         Some(Command::Clean(args)) => run_clean(&cli, args),
-        Some(Command::Maintain(args)) => run_maintenance(args),
+        Some(Command::Maintain(args)) => run_maintenance(&cli.scan, args),
         None => run_scan_or_tui(&cli),
     }
 }
 
-fn run_maintenance(args: &MaintainArgs) -> anyhow::Result<()> {
+fn run_maintenance(scan: &ScanArgs, args: &MaintainArgs) -> anyhow::Result<()> {
+    if !scan.paths.is_empty()
+        || scan.all
+        || scan.merged
+        || scan.inactive.is_some()
+        || scan.created_before.is_some()
+        || scan.max_depth != 8
+    {
+        bail!("maintain reads scan roots and age policy from --config; do not pass scan options");
+    }
     let executable = std::env::current_exe().context("cannot locate wtrm executable")?;
     let directory = executable
         .parent()

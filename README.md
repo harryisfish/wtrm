@@ -2,7 +2,7 @@
 
 扫描这台机器上的 git worktree。按最后活跃程度列出仓库、分支、所在文件夹和路径，在终端里多选删除，或只清掉依赖目录。
 
-给本地有一堆 worktree、想按「已合并」「很久没动」「创建很久且最近没动」收拾的人用。扫描不联网，也不查 pull request。
+给本地有一堆 worktree、想按「已合并」「很久没动」「创建很久且最近没动」收拾的人用。手动扫描不联网，也不查 pull request；后台维护会联网核对 GitHub PR。
 
 ## 安装
 
@@ -80,15 +80,17 @@ JSON 顶层固定为：
 
 `--list` 表格第一列是短 id（8 位）。完整 16 位 id 在 JSON 和 TUI 详情行。`delete` / `clean` 必须带 `--path` 或 `--id`。
 
-## 自动回收 macOS 外置盘
+## 后台定期清理 macOS 外置盘
 
-`scripts/reclaim-space.py` 默认只生成报告。`--apply` 才回收已合并工作树和旧 Turbo 缓存，保留所有分支，不运行 `clean` 或 `--force`。
+`wtrm maintain --config <path>` 每次扫描并生成一份报告，默认 dry-run。显式 `--yes` 才删除，`--apply` 仍可使用。macOS LaunchAgent 定期调用此入口，不需要保持终端打开。
 
-工作树必须创建满 7 天。程序检查 GitHub PR 已合并且 HEAD 完全相同，重新检查未提交内容、子模块、未推送提交、打开文件和 Codex 会话。锁定、嵌套、含 planning、状态未知的工作树会保留。Pinned 会话始终保护相关目录，最近 7 天的未归档会话也保护相关目录。无关目录的会话不锁住整盘；会话后来跨目录访问的行为无法只凭 cwd 推断，程序同时检查当时打开的文件。
+创建年龄和空闲年龄按「或者」匹配。例如 `--created-before 30d --inactive 7d` 允许创建满 30 天或最近 7 天未活跃的工作树进入安全检查。只要一个条件满足即可，创建很久但刚活跃的工作树也可能匹配。单个条件用 `none` 禁用，两个条件不能同时禁用。默认只启用创建满 7 天，间隔为 `1h`。时长接受正整数和 `s`、`m`、`h`、`d`、`w`，不带单位时为秒，拒绝零、负数和溢出值。手动查询的多个条件仍是「并且」。
+
+空闲年龄沿用扫描的近似活跃时间，即提交、git index 和 worktree 根目录的最新修改时间，不能准确反映所有文件阅读或嵌套文件活动。未知、无效或未来的时间不会命中对应条件。程序还检查 GitHub PR 已合并且 HEAD 完全相同，重新检查未提交内容、子模块、未推送提交、打开文件和 Codex 会话。锁定、缺失、嵌套、含 planning、状态未知，以及包含当前进程目录、维护程序、配置或报告的工作树会保留。Pinned 会话始终保护相关目录，最近 7 天的未归档会话也保护相关目录。无关目录的会话不锁住整盘；会话后来跨目录访问的行为无法只凭 cwd 推断，程序同时检查当时打开的文件。
 
 Git 忽略的内容也会检查。自动删除只放行 `node_modules`、`target`、`.next`、`.turbo`、`.venv`、`venv`、`__pycache__`、`Pods`、`.gradle`、`DerivedData`、`build`、`dist`、`.artifacts` 这些可重建目录和 `.DS_Store`。其他 ignored 文件或目录，例如 `.env.local`、`.cursor` 配置和本地数据，会阻止回收并记入报告。此保护不改变手动 `wtrm delete` 的行为。
 
-缓存按仓库合计主检出和附加工作树的 `.turbo/cache`。软上限是 5 GiB。超过上限时，按修改时间淘汰超过 24 小时、未被打开的完整 hash 组，包括归档、meta 和 manifest。近期或被占用的组可以让缓存暂时超过上限，报告会显示剩余超限量。未知文件保留。
+新安装默认只回收工作树，保留所有分支，不运行 `clean` 或 `--force`。加 `--include-cache` 才同时回收旧 Turbo 缓存。缓存按仓库合计主检出和附加工作树的 `.turbo/cache`，软上限是 5 GiB。超过上限时，按修改时间淘汰超过 24 小时、未被打开的完整 hash 组，包括归档、meta 和 manifest。近期或被占用的组可以让缓存暂时超过上限，报告会显示剩余超限量。未知文件保留。
 
 缓存发现包括扫描根本身、wtrm 已发现的仓库，以及根目录下最多 8 层的主仓库，即使它没有附加工作树。发现过程跳过依赖和构建目录，找到仓库后不再进入其内部，最多检查 10 万个条目。
 
@@ -98,21 +100,40 @@ Git 忽略的内容也会检查。自动删除只放行 `node_modules`、`target
 CARGO_TARGET_DIR=.artifacts/target cargo build --locked --release
 python3 scripts/install-reclaim-space.py \
   --wtrm "$PWD/.artifacts/target/release/wtrm" \
-  --root /Volumes/ssd/project --mount /Volumes/ssd \
+  --root /Volumes/Work/projects --mount /Volumes/Work \
   --volume-uuid EXTERNAL-VOLUME-UUID \
+  --created-before 30d --inactive 7d --interval 6h \
   --report-dir /absolute/task-planning/evidence/maintenance
 ```
 
-安装器写入 `~/.local/lib/wtrm-maintenance` 和 `~/Library/LaunchAgents/com.wtrm.maintenance.plist`，不覆盖现有 `wtrm`，也不加载任务。先运行安装器输出的 dry-run 命令，检查报告后再启用：
+仅按空闲年龄清理时，改用 `--created-before none --inactive 14d`。安装器写入 `~/.local/lib/wtrm-maintenance` 和 `~/Library/LaunchAgents/com.wtrm.maintenance.plist`，不覆盖现有 `wtrm`，也不加载任务。策略保存在私有 `config.json`：
+
+```json
+{
+  "root": "/Volumes/Work/projects",
+  "mount": "/Volumes/Work",
+  "volume_uuid": "EXTERNAL-VOLUME-UUID",
+  "wtrm": "/absolute/private-install/wtrm",
+  "codex_db": "/absolute/home/.codex/state_5.sqlite",
+  "report_dir": "/absolute/task-planning/evidence/maintenance",
+  "created_before": "30d",
+  "inactive": "7d",
+  "reclaim_cache": false
+}
+```
+
+直接修改 JSON 策略会在下一轮生效，`null` 禁用对应年龄条件。`maintain` 从配置文件读取根目录和阈值，拒绝命令行扫描根、筛选参数和非默认扫描深度；上述年龄参数传给安装器。原有六字段配置继续按创建满 7 天且开启缓存回收运行。运行间隔保存在 plist 的 `StartInterval` 秒数中。修改间隔时先停用任务，再用新参数重新运行安装器并加载。
+
+先运行安装器输出的 dry-run 命令，检查报告后再启用：
 
 ```bash
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.wtrm.maintenance.plist"
 launchctl kickstart "gui/$(id -u)/com.wtrm.maintenance"
 ```
 
-定时任务以私有 `wtrm maintain --config <path> --apply` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。不带 `--apply` 时只读。这样维护程序使用自己的原生授权入口，外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。
+定时任务以私有 `wtrm maintain --config <path> --yes` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。维护需要 `git`、已认证的 `gh`、`diskutil`、`lsof` 和可读的 Codex 会话数据库。外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。此维护入口只支持 macOS，不影响其他平台的手动扫描和删除。
 
-任务每小时运行，使用单实例锁，仅保留最近 20 份报告。外置盘身份不匹配、活动探测失败或 GitHub 状态无法确认时保留数据。文件和进程检查不能原子锁住随后启动的其他程序，程序会在删除前复核身份；不要把它当作并发写入锁。
+任务按配置间隔运行，每轮重新扫描，使用同一安装目录的单实例锁，仅保留最近 20 份报告。launchd 不会并发启动同一任务，错过的周期不会堆积。不要用多个安装目录同时清理同一个扫描根，它们不共享锁。外置盘身份不匹配、活动探测失败或 GitHub 状态无法确认时保留数据。文件和进程检查不能原子锁住随后启动的其他程序，程序会在删除前复核身份；不要把它当作并发写入锁。
 
 停用定时任务：
 
@@ -150,7 +171,7 @@ launchctl bootout "gui/$(id -u)/com.wtrm.maintenance"
 
 ## 和其他工具
 
-机器范围的清理已经有人做了。wtrm 只做本地盘点：最后活跃时间、创建时间、是否已合并、所属文件夹、仓库，以及多选删除或清理依赖。
+机器范围的清理已经有人做了。wtrm 提供本地盘点、交互删除和依赖清理，也可在 macOS 上按配置定期回收满足保护条件的旧 worktree。
 
 - [wtkill](https://github.com/ohernandezdev/wtkill)：最接近。递归扫描、年龄、体积，TUI 删除，也有 JSON。
 - [gh-reaper](https://github.com/ai-ecoverse/gh-reaper)：`gh` 扩展。按年龄和体积列出，可核对 PR 是否已合并。
