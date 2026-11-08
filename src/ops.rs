@@ -21,11 +21,12 @@ pub fn delete_targets(
     execute: bool,
     force: bool,
     branches: BranchScope,
+    expected_head: Option<&str>,
 ) -> Vec<ActionItem> {
     let (targets, mut items) = resolve_targets(worktrees, paths, ids, "delete");
     if execute {
         let paths: Vec<PathBuf> = targets.iter().map(|wt| wt.path.clone()).collect();
-        let report = remove::delete_many(worktrees, &paths, force, branches);
+        let report = remove::delete_many(worktrees, &paths, force, branches, expected_head);
         for outcome in report.worktrees {
             let Some(wt) = targets.iter().find(|wt| wt.path == outcome.path) else {
                 continue;
@@ -53,7 +54,13 @@ pub fn delete_targets(
         }
     } else {
         for wt in targets {
-            items.push(describe_delete(wt, force, "dry-run"));
+            let mut item = describe_delete(wt, force, "dry-run");
+            if expected_head.is_some_and(|head| wt.head != head) {
+                item.result = "blocked".to_string();
+                item.blocked_by = Some("HEAD changed".to_string());
+                item.reason = "worktree HEAD does not match --expected-head".to_string();
+            }
+            items.push(item);
         }
     }
     items
@@ -367,6 +374,7 @@ mod tests {
             false,
             false,
             BranchScope::Keep,
+            None,
         );
         assert_eq!(items[0].result, "dry-run");
         assert_eq!(items[0].path, wt.path);
@@ -383,6 +391,7 @@ mod tests {
             false,
             false,
             BranchScope::Keep,
+            None,
         );
         assert_eq!(items[0].result, "blocked");
         assert_eq!(items[0].blocked_by.as_deref(), Some("not found"));
@@ -399,6 +408,7 @@ mod tests {
             false,
             false,
             BranchScope::Keep,
+            None,
         );
         assert_eq!(items[0].id, wt.id);
         assert_eq!(items[0].result, "dry-run");

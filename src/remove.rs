@@ -58,6 +58,7 @@ pub fn delete_many(
     paths: &[std::path::PathBuf],
     force: bool,
     branches: BranchScope,
+    expected_head: Option<&str>,
 ) -> DeleteReport {
     let mut worktrees = Vec::new();
     let mut removed = Vec::new();
@@ -65,7 +66,7 @@ pub fn delete_many(
         let Some(wt) = items.iter().find(|wt| &wt.path == path) else {
             continue;
         };
-        let error = delete_one(wt, force).err();
+        let error = delete_one(wt, force, expected_head).err();
         if error.is_none() {
             removed.push(wt);
         }
@@ -85,9 +86,42 @@ pub fn delete_many(
     }
 }
 
-pub fn delete_one(wt: &Worktree, force: bool) -> Result<(), String> {
+pub fn delete_one(wt: &Worktree, force: bool, expected_head: Option<&str>) -> Result<(), String> {
     if wt.main || wt.bare || wt.path == wt.repo_root {
         return Err("refusing to delete the main checkout".to_string());
+    }
+
+    if let Some(expected) = expected_head {
+        let mut cmd = crate::git::command();
+        cmd.arg("-C").arg(&wt.path).args(["rev-parse", "HEAD"]);
+        let current = crate::git::stdout_text(cmd, crate::git::QUICK)?;
+        if current != expected || wt.head != expected {
+            return Err("worktree HEAD changed before deletion".to_string());
+        }
+        let mut cmd = crate::git::command();
+        cmd.arg("-C")
+            .arg(&wt.path)
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        if crate::git::stdout_text(cmd, crate::git::QUICK)? != wt.branch {
+            return Err("worktree branch changed before deletion".to_string());
+        }
+        let mut cmd = crate::git::command();
+        cmd.arg("-C").arg(&wt.path).args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ]);
+        let out = crate::git::output(cmd, crate::git::QUICK)?;
+        if !out.status.success() || !out.stdout.is_empty() {
+            return Err("worktree is not clean before deletion".to_string());
+        }
+        let mut cmd = crate::git::command();
+        cmd.arg("-C").arg(&wt.path).args(["rev-parse", "HEAD"]);
+        if crate::git::stdout_text(cmd, crate::git::QUICK)? != expected {
+            return Err("worktree HEAD changed before deletion".to_string());
+        }
     }
     if !force {
         if wt.locked {
@@ -370,6 +404,7 @@ gitlab\tgit@gitlab.com:acme/demo.git (push)
             std::slice::from_ref(&feature.path),
             false,
             BranchScope::Local,
+            None,
         );
         assert!(
             report.worktrees[0].error.is_none(),
@@ -396,7 +431,7 @@ gitlab\tgit@gitlab.com:acme/demo.git (push)
     #[test]
     fn refuses_main_checkout() {
         let wt = fixture("/repos/demo", "demo", true, Some(10));
-        let err = delete_one(&wt, true).unwrap_err();
+        let err = delete_one(&wt, true, None).unwrap_err();
         assert!(err.contains("main checkout"));
     }
 
@@ -450,7 +485,7 @@ gitlab\tgit@gitlab.com:acme/demo.git (push)
             .clone();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&linked).unwrap();
-        let deleted = delete_one(&feature, false);
+        let deleted = delete_one(&feature, false, None);
         let _ = std::env::set_current_dir(&prev);
         deleted.unwrap();
         assert!(!linked.exists());

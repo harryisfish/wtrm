@@ -702,6 +702,7 @@ fn run_delete(
             true,
             force,
             branches,
+            None,
         ));
     }
     app.apply_mutate_result(all);
