@@ -119,6 +119,90 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
         self.assertEqual((self.repo / "source.txt").read_text(), "source\n")
 
+    def test_age_policy_matches_either_threshold_and_rejects_unknown_times(self):
+        self.config.created_before = 30 * 86400
+        self.config.inactive = 7 * 86400
+        young, old_created, idle = self.now - 86400, self.now - 30 * 86400, self.now - 7 * 86400
+        for created, active, expected in ((old_created, young, True), (young, idle, True),
+                                           (young, young, False), (None, idle, True),
+                                           (old_created, None, True), (None, None, False)):
+            with self.subTest(created=created, active=active):
+                self.assertEqual(self.config.matches_age({"created_at": created, "last_active": active},
+                                                          self.now), expected)
+        for stamp in (None, True, "1", 0, -1, self.now + 1, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(stamp=stamp):
+                self.assertFalse(self.config.matches_age({"created_at": stamp, "last_active": stamp}, self.now))
+        self.config.created_before = None
+        self.assertFalse(self.config.matches_age({"created_at": old_created, "last_active": young}, self.now))
+        self.config.inactive = None
+        self.config.created_before = 30 * 86400
+        self.assertFalse(self.config.matches_age({"created_at": young, "last_active": idle}, self.now))
+
+    def test_inactive_cleanup_rescans_each_run_and_preserves_cache_by_configuration(self):
+        self.config.created_before = 30 * 86400
+        self.config.inactive = 7 * 86400
+        self.config.reclaim_cache = False
+        cached = self.cache_group("a" * 16)
+        with patch.object(M, "repository_caches", side_effect=AssertionError("cache discovery disabled")):
+            result = self.run_maintenance()
+            self.assertEqual(self.target_result(result)["action"], "would_remove", result)
+            self.assertTrue(self.linked.exists())
+            (self.linked / "source.txt").write_text("new work\n")
+            result = self.run_maintenance(True)
+            self.assertEqual(self.target_result(result)["action"], "skip", result)
+            self.assertTrue(self.linked.exists())
+            self.git(self.linked, "restore", "source.txt")
+            result = self.run_maintenance(True)
+        self.assertEqual(self.target_result(result)["action"], "removed", result)
+        self.assertEqual(result["worktree_policy"]["match"], "any")
+        self.assertEqual(result["caches"], [])
+        self.assertTrue(all(path.exists() for path in cached))
+        self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
+
+    def test_maintenance_paths_and_unknown_status_are_preserved(self):
+        self.config.validate_volume()
+        rows = M.scan(self.config)
+        for attribute in ("wtrm", "report_dir", "config_path"):
+            with self.subTest(attribute=attribute), patch.object(self.config, attribute, self.linked / "local"):
+                result = M.reclaim_worktrees(self.config, rows, self.now, True)
+                self.assertIn("running maintenance", next(row for row in result if row["path"] == str(self.linked))["reason"])
+        with patch.object(M.Path, "cwd", return_value=self.linked):
+            result = self.run_maintenance(True)
+        self.assertIn("cwd", self.target_result(result)["reason"])
+        rows = M.scan(self.config)
+        next(row for row in rows if row["path"] == str(self.linked))["dirty"] = None
+        result = M.reclaim_worktrees(self.config, rows, self.now, True)
+        self.assertIn("unknown", next(row for row in result if row["path"] == str(self.linked))["reason"])
+        self.assertTrue(self.linked.exists())
+
+    def test_configuration_defaults_validation_and_optional_thresholds(self):
+        path = self.base / "configuration.json"
+        data = {key: str(getattr(self.config, key)) for key in
+                ("root", "mount", "volume_uuid", "wtrm", "codex_db", "report_dir")}
+        path.write_text(json.dumps(data))
+        legacy = M.Config.read(path)
+        self.assertEqual(legacy.created_before, 7 * 86400)
+        self.assertIsNone(legacy.inactive)
+        self.assertTrue(legacy.reclaim_cache)
+        data.update(created_before=None, inactive="14d", reclaim_cache=False)
+        path.write_text(json.dumps(data))
+        current = M.Config.read(path)
+        self.assertIsNone(current.created_before)
+        self.assertEqual(current.inactive, 14 * 86400)
+        self.assertFalse(current.reclaim_cache)
+        for field, value in (("inactive", None), ("inactive", "0d"), ("inactive", "-1d"),
+                             ("inactive", "9999999999999w"), ("inactive", True),
+                             ("inactive", 7), ("reclaim_cache", "false"), ("extra", "unknown")):
+            with self.subTest(field=field, value=value):
+                path.write_text(json.dumps(dict(data, **{field: value})))
+                with self.assertRaises(M.Unsafe):
+                    M.Config.read(path)
+        for raw in ("0", "0s", "-1h", "1.5d", "1x", "9999999999999w", "", True):
+            with self.subTest(raw=raw), self.assertRaises(M.Unsafe):
+                M.duration(raw)
+        self.assertEqual(M.duration("6h"), 21600)
+        self.assertEqual(M.duration("2147483647s"), M.MAX_DURATION)
+
     def test_expected_head_refuses_changed_commit_and_invalid_options(self):
         rows = json.loads(self.original_command([str(BINARY), "--json", str(self.root)]).stdout)["worktrees"]
         row = next(row for row in rows if row["path"] == str(self.linked))
@@ -293,8 +377,18 @@ class MaintenanceTests(unittest.TestCase):
         args = [sys.executable, str(PROJECT / "scripts/install-reclaim-space.py"),
                 "--wtrm", str(BINARY), "--root", str(self.root), "--mount", str(self.mount),
                 "--volume-uuid", "TEST-UUID", "--report-dir", str(self.config.report_dir),
-                "--codex-db", str(self.database), "--install-dir", str(install)]
+                "--codex-db", str(self.database), "--install-dir", str(install),
+                "--created-before", "30d", "--inactive", "7d", "--interval", "6h"]
         env = dict(os.environ, HOME=str(home), PATH=str(commands) + os.pathsep + os.environ["PATH"])
+        for invalid in (["--interval", "0s"], ["--interval", "-1h"],
+                        ["--interval", "9999999999999w"], ["--created-before", "0d"],
+                        ["--created-before", "none", "--inactive", "none"]):
+            with self.subTest(invalid=invalid):
+                result = subprocess.run(args + invalid, env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(install.exists())
+                self.assertFalse(self.config.report_dir.exists())
+                self.assertFalse((home / "Library/LaunchAgents/com.wtrm.maintenance.plist").exists())
         result = subprocess.run(args, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         installed = json.loads(result.stdout)
@@ -303,10 +397,20 @@ class MaintenanceTests(unittest.TestCase):
         self.assertFalse((home / ".cargo/bin/wtrm").exists())
         agent = plistlib.loads(Path(installed["launch_agent"]).read_bytes())
         self.assertFalse(agent["RunAtLoad"])
-        self.assertEqual(agent["StartInterval"], 3600)
+        self.assertEqual(agent["StartInterval"], 21600)
+        policy = json.loads((install / "config.json").read_text())
+        self.assertEqual(policy["created_before"], "30d")
+        self.assertEqual(policy["inactive"], "7d")
+        self.assertFalse(policy["reclaim_cache"])
         native_entry = [str(install / "wtrm"), "maintain", "--config", str(install / "config.json")]
         self.assertEqual(installed["dry_run"], native_entry)
-        self.assertEqual(agent["ProgramArguments"], native_entry + ["--apply"])
+        self.assertEqual(agent["ProgramArguments"], native_entry + ["--yes"])
+        result = subprocess.run(args + ["--include-cache", "--created-before", "none"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        policy = json.loads((install / "config.json").read_text())
+        self.assertIsNone(policy["created_before"])
+        self.assertTrue(policy["reclaim_cache"])
 
     def test_installer_rejects_old_binary_before_writing_files(self):
         home = self.base / "old-binary-home"
@@ -356,10 +460,18 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(observed["args"], ["--config", str(config)])
         self.assertEqual(observed["parent"], process.pid)
         self.assertEqual(observed["isolated"], 1)
-        result = subprocess.run(args + ["--apply"], capture_output=True)
-        self.assertEqual(result.returncode, 7)
-        self.assertEqual(json.loads(config.read_text())["args"], ["--config", str(config), "--apply"])
+        for execute in ("--apply", "--yes"):
+            result = subprocess.run(args + [execute], capture_output=True)
+            self.assertEqual(result.returncode, 7)
+            self.assertEqual(json.loads(config.read_text())["args"], ["--config", str(config), "--apply"])
         config.unlink()
+        for extra in (["--inactive", "1d"], ["--created-before", "30d"], ["--all"],
+                      ["--merged"], ["--max-depth", "9"], [str(self.root)]):
+            with self.subTest(extra=extra):
+                result = subprocess.run(args + ["--yes", *extra], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"do not pass scan options", result.stderr)
+                self.assertFalse(config.exists())
         result = subprocess.run(args + ["--script", str(PROJECT / "scripts/reclaim-space.py")], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(config.exists())

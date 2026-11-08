@@ -6,6 +6,7 @@ import contextlib
 import datetime
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 
 
 WORKTREE_AGE = 7 * 86400
+MAX_DURATION = 2 ** 31 - 1
 CACHE_AGE = 86400
 CACHE_LIMIT = 5 * 1024 ** 3
 REPORT_LIMIT = 20
@@ -32,6 +34,28 @@ REBUILDABLE_DIRS = frozenset((
 
 class Unsafe(RuntimeError):
     pass
+
+
+def duration(raw):
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9]+[smhdw]?", raw):
+        raise Unsafe("duration must be positive, for example 30d, 48h, or 2w")
+    unit = raw[-1] if raw[-1].isalpha() else "s"
+    seconds = int(raw[:-1] if raw[-1].isalpha() else raw) * {
+        "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400,
+    }[unit]
+    if not 0 < seconds <= MAX_DURATION:
+        raise Unsafe("duration is zero or exceeds the supported range")
+    return seconds
+
+
+def optional_duration(raw):
+    if raw == "none":
+        return None
+    try:
+        duration(raw)
+    except Unsafe as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return raw
 
 
 def command(args, check=True):
@@ -97,15 +121,40 @@ class Config:
     codex_db: Path
     report_dir: Path
     device: int = 0
+    created_before: int = WORKTREE_AGE
+    inactive: int = None
+    reclaim_cache: bool = True
+    config_path: Path = None
+
+    def __post_init__(self):
+        if self.created_before is None and self.inactive is None:
+            raise Unsafe("enable at least one worktree age threshold")
+        if any(value is not None and (type(value) is not int or not 0 < value <= MAX_DURATION)
+               for value in (self.created_before, self.inactive)):
+            raise Unsafe("invalid worktree age threshold")
+        if type(self.reclaim_cache) is not bool:
+            raise Unsafe("reclaim_cache must be a boolean")
 
     @classmethod
     def read(cls, path):
         data = json.loads(safe_path(path).read_text())
         fields = ("root", "mount", "volume_uuid", "wtrm", "codex_db", "report_dir")
-        if set(data) != set(fields) or not all(isinstance(data[k], str) for k in fields):
+        optional = {"created_before", "inactive", "reclaim_cache"}
+        if (not isinstance(data, dict) or not set(fields) <= set(data)
+                or set(data) - set(fields) - optional
+                or not all(isinstance(data[k], str) for k in fields)):
             raise Unsafe("invalid configuration")
+        ages = {name: duration(data.get(name, default)) if data.get(name, default) is not None else None
+                for name, default in (("created_before", "7d"), ("inactive", None))}
         return cls(Path(data["root"]), Path(data["mount"]), data["volume_uuid"],
-                   Path(data["wtrm"]), Path(data["codex_db"]), Path(data["report_dir"]))
+                   Path(data["wtrm"]), Path(data["codex_db"]), Path(data["report_dir"]),
+                   **ages, reclaim_cache=data.get("reclaim_cache", True), config_path=Path(path))
+
+    def matches_age(self, row, now):
+        return any(age is not None and type(stamp) in (int, float)
+                   and 0 < stamp <= now and math.isfinite(stamp) and now - stamp >= age
+                   for stamp, age in ((row.get("created_at"), self.created_before),
+                                      (row.get("last_active"), self.inactive)))
 
     def validate_volume(self):
         self.mount = safe_path(self.mount)
@@ -334,10 +383,15 @@ def reclaim_worktrees(config, worktrees, now, apply):
                 raise Unsafe("unknown worktree state")
             if row.get("main") or row.get("bare") or row.get("locked") or row.get("missing"):
                 raise Unsafe("main, bare, locked, or missing worktree")
-            created = row.get("created_at")
-            if not isinstance(created, (int, float)) or created <= 0 or now - created < WORKTREE_AGE:
-                raise Unsafe("worktree is younger than seven days or age is unknown")
+            if row.get("dirty") is not False:
+                raise Unsafe("worktree has uncommitted content or status is unknown")
+            if not config.matches_age(row, now):
+                raise Unsafe("no enabled age threshold matches; unknown ages do not match")
             path = config.bound(path)
+            protected = (Path.cwd().resolve(), Path(__file__).resolve(), config.wtrm,
+                         config.report_dir, config.config_path)
+            if any(value is not None and below(value, path) for value in protected):
+                raise Unsafe("worktree contains the running maintenance program, configuration, reports, or cwd")
             config.bound(row["repo_root"])
             config.bound(row["git_common_dir"])
             if not safe_path(path / ".git").is_file():
@@ -544,6 +598,9 @@ def run(config, apply=False, now=None):
     now = time.time() if now is None else now
     result = {"started_at": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
               "apply": apply, "worktrees": [], "caches": [], "errors": [],
+              "worktree_policy": {"created_before_seconds": config.created_before,
+                                  "inactive_seconds": config.inactive, "match": "any"},
+              "reclaim_cache": config.reclaim_cache,
               "activity_scope": "canonical session cwd and open files; later cross-cwd use cannot be inferred"}
     try:
         config.validate_volume()
@@ -551,9 +608,10 @@ def run(config, apply=False, now=None):
         result["free_before_bytes"] = before.f_bavail * before.f_frsize
         worktrees = scan(config)
         result["worktrees"] = reclaim_worktrees(config, worktrees, now, apply)
-        for repo, directories in repository_caches(config, worktrees).items():
-            if directories:
-                result["caches"].append(reclaim_cache(config, repo, directories, now, apply))
+        if config.reclaim_cache:
+            for repo, directories in repository_caches(config, worktrees).items():
+                if directories:
+                    result["caches"].append(reclaim_cache(config, repo, directories, now, apply))
         after = os.statvfs(config.mount)
         result["free_after_bytes"] = after.f_bavail * after.f_frsize
     except (Unsafe, OSError, ValueError, KeyError, plistlib.InvalidFileException) as error:
@@ -579,7 +637,7 @@ def save_report(directory, result):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--apply", action="store_true", help="execute instead of dry-run")
+    parser.add_argument("--apply", "--yes", action="store_true", help="execute instead of dry-run")
     args = parser.parse_args()
     config = Config.read(args.config)
     prepare_directory(config.report_dir)
