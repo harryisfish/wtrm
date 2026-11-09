@@ -422,7 +422,7 @@ def reclaim_worktrees(config, worktrees, now, apply):
             activity.fresh()
             args = [str(config.wtrm), "delete", "--id", row["id"], "--expected-head", head,
                     "--branches", "keep", "--json", "--yes" if apply else "--dry-run", str(config.root)]
-            result = json.loads(command(args).stdout)
+            result = json.loads(command(args, timeout=600).stdout)
             items = result.get("items", [])
             expected = "ok" if apply else "dry-run"
             if (result.get("errors") or len(items) != 1 or items[0].get("result") != expected
