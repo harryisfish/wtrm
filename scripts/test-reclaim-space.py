@@ -108,6 +108,21 @@ class MaintenanceTests(unittest.TestCase):
             os.utime(path, (self.now - age, self.now - age))
         return paths
 
+    def test_scan_can_complete_after_the_default_command_deadline(self):
+        original_run = subprocess.run
+        scan_args = [str(self.config.wtrm), "--json", str(self.root)]
+
+        def delayed_scan(args, **kwargs):
+            if args == scan_args and kwargs["timeout"] < 61:
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return original_run(args, **kwargs)
+
+        with patch.object(M.subprocess, "run", side_effect=delayed_scan):
+            result = self.run_maintenance()
+        self.assertEqual(result["status"], "complete", result)
+        self.assertEqual(self.target_result(result)["action"], "would_remove", result)
+        self.assertTrue(self.linked.exists())
+
     def test_dry_run_and_delete_keep_source_branch(self):
         result = self.run_maintenance()
         self.assertEqual(result["status"], "complete", result)
