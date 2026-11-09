@@ -84,7 +84,7 @@ JSON 顶层固定为：
 
 `--list` 表格第一列是短 id（8 位）。完整 16 位 id 在 JSON 和 TUI 详情行。`delete` / `clean` 必须带 `--path` 或 `--id`。
 
-`delete --expected-head <完整 commit hash>` 只接受一个目标，删除前复核提交和分支。加 `--force` 可丢弃未提交内容，但仍保留锁定、缺失、状态未知、含子模块或已注册嵌套工作树的目标。这个组合只向 Git 传一个 `--force`，不会越过锁定保护。不带 `--expected-head` 的手动强制删除仍使用两个 `--force`。
+`delete --expected-head <完整 commit hash>` 只接受一个目标，删除前复核提交和分支。加 `--force` 可丢弃未提交内容，但仍保留锁定、缺失、状态未知、含子模块或已注册嵌套工作树的目标。这个组合只向 Git 传一个 `--force`，不会越过锁定保护。 这些额外保护在 dry-run 中返回 `blocked` 和 `blocked_by`，执行时可能返回 `failed` 且 `blocked_by` 为空，拒绝原因在 `reason` 中，目标仍保留。不带 `--expected-head` 的手动强制删除仍使用两个 `--force`。
 
 ## 后台定期清理 macOS 外置盘
 
