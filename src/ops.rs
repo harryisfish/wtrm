@@ -79,67 +79,6 @@ pub fn clean_targets(
     items
 }
 
-pub fn summarize_items(items: &[ActionItem]) -> String {
-    let ok = items.iter().filter(|item| item.result == "ok").count();
-    let dry = items.iter().filter(|item| item.result == "dry-run").count();
-    let blocked = items.iter().filter(|item| item.result == "blocked").count();
-    let failed = items.iter().filter(|item| item.result == "failed").count();
-    let mut parts = Vec::new();
-    if ok > 0 {
-        parts.push(format!("{ok} succeeded"));
-    }
-    if dry > 0 {
-        parts.push(format!("{dry} dry-run"));
-    }
-    if blocked > 0 {
-        let sample = items.iter().find(|item| item.result == "blocked");
-        match sample {
-            Some(item) => parts.push(format!(
-                "{blocked} blocked ({}: {})",
-                crate::scan::shorten_path(&item.path),
-                item.blocked_by.as_deref().unwrap_or(item.reason.as_str())
-            )),
-            None => parts.push(format!("{blocked} blocked")),
-        }
-    }
-    if failed > 0 {
-        let sample = items.iter().find(|item| item.result == "failed");
-        match sample {
-            Some(item) => parts.push(format!(
-                "{failed} failed ({}: {})",
-                crate::scan::shorten_path(&item.path),
-                item.reason
-            )),
-            None => parts.push(format!("{failed} failed")),
-        }
-    }
-    if parts.is_empty() {
-        "no matching worktrees".to_string()
-    } else {
-        parts.join(", ")
-    }
-}
-
-pub fn result_lines(items: &[ActionItem], max: usize) -> Vec<String> {
-    let mut lines: Vec<String> = items
-        .iter()
-        .take(max)
-        .map(|item| {
-            format!(
-                "{}  {}  {}  {}",
-                item.result,
-                crate::scan::shorten_path(&item.path),
-                item.blocked_by.as_deref().unwrap_or("-"),
-                item.reason
-            )
-        })
-        .collect();
-    if items.len() > max {
-        lines.push(format!("  …{} more", items.len() - max));
-    }
-    lines
-}
-
 pub fn counts(items: &[ActionItem]) -> (usize, usize) {
     let succeeded = items
         .iter()
