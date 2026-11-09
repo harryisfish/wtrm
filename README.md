@@ -144,9 +144,9 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.wtrm.maintena
 launchctl kickstart "gui/$(id -u)/com.wtrm.maintenance"
 ```
 
-定时任务以私有 `wtrm maintain --config <path> --yes` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。维护需要 `git`、已认证的 `gh`、`diskutil`、`lsof` 和可读的 Codex 会话数据库。外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。此维护入口只支持 macOS，不影响其他平台的手动扫描和删除。
+定时任务以私有 `wtrm maintain --config <path> --yes` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。维护需要 `git`、`diskutil`、`lsof` 和可读的 Codex 会话数据库。默认保守策略还需要已认证的 `gh`，`discard_stale` 策略不需要 `gh`。外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。此维护入口只支持 macOS，不影响其他平台的手动扫描和删除。
 
-任务按配置间隔运行，每轮重新扫描，使用同一安装目录的单实例锁，仅保留最近 20 份报告。launchd 不会并发启动同一任务，错过的周期不会堆积。不要用多个安装目录同时清理同一个扫描根，它们不共享锁。外置盘身份不匹配、活动探测失败或 GitHub 状态无法确认时保留数据。文件和进程检查不能原子锁住随后启动的其他程序，程序会在删除前复核身份；不要把它当作并发写入锁。
+任务按配置间隔运行，每轮重新扫描，使用同一安装目录的单实例锁，仅保留最近 20 份报告。launchd 不会并发启动同一任务，错过的周期不会堆积。不要用多个安装目录同时清理同一个扫描根，它们不共享锁。外置盘身份不匹配或活动探测失败时保留数据。默认保守策略在 GitHub 状态无法确认时也保留数据。文件和进程检查不能原子锁住随后启动的其他程序，程序会在删除前复核身份；不要把它当作并发写入锁。
 
 停用定时任务：
 
