@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::ops;
@@ -67,8 +67,17 @@ impl ActionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pending {
     None,
-    Delete,
+    Delete { force: bool },
     Clean,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Browse,
+    Detail,
+    Selected,
+    Results,
+    Help,
 }
 
 pub struct App {
@@ -93,6 +102,9 @@ pub struct App {
     pub stale_idle_secs: i64,
     pub branch_scope: remove::BranchScope,
     visible: Vec<usize>,
+    view: View,
+    scroll: usize,
+    viewport: Rect,
 }
 
 impl App {
@@ -120,6 +132,9 @@ impl App {
             stale_idle_secs: 7 * 86_400,
             branch_scope: remove::BranchScope::Keep,
             visible: Vec::new(),
+            view: View::Browse,
+            scroll: 0,
+            viewport: Rect::new(0, 0, 80, 24),
         };
         app.apply_scan(result);
         app.note = if let Some(err) = errors.first() {
@@ -142,6 +157,7 @@ impl App {
         });
         self.pending = Pending::None;
         self.confirm_buf.clear();
+        self.scroll = 0;
         self.now = timeutil::now_unix();
         self.clamp_cursor();
         before.saturating_sub(self.selected.len())
@@ -150,7 +166,7 @@ impl App {
     pub fn apply_mutate_result(&mut self, items: Vec<ActionItem>) {
         let gone: HashSet<PathBuf> = items
             .iter()
-            .filter(|item| item.result == "ok")
+            .filter(|item| item.action == "delete" && item.result == "ok")
             .map(|item| item.path.clone())
             .collect();
         self.items.retain(|wt| !gone.contains(&wt.path));
@@ -175,11 +191,13 @@ impl App {
             .len();
         let (succeeded, failed) = ops::counts(&items);
         self.op = OperationStatus::Finished { succeeded, failed };
-        self.note = ops::summarize_items(&items);
+        self.note.clear();
         self.last_result = items;
         self.pending = Pending::None;
         self.confirm_buf.clear();
         self.confirm_hint.clear();
+        self.view = View::Results;
+        self.scroll = 0;
         self.clamp_cursor();
     }
 
@@ -192,7 +210,7 @@ impl App {
             OperationStatus::Finished { succeeded, failed } => Some(if failed == 0 {
                 format!("finished: {succeeded} succeeded")
             } else {
-                format!("finished: {succeeded} succeeded, {failed} failed")
+                format!("finished: {succeeded} succeeded, {failed} failed or blocked")
             }),
         };
         match (op, self.note.is_empty()) {
@@ -247,6 +265,8 @@ impl App {
             self.on_filter_key(code)
         } else if self.pending != Pending::None {
             self.on_confirm_key(code)
+        } else if self.view != View::Browse {
+            self.on_view_key(code)
         } else {
             self.on_browse_key(code)
         };
@@ -277,71 +297,131 @@ impl App {
     }
 
     fn on_confirm_key(&mut self, code: KeyCode) -> Action {
+        if self.scroll_key(code) {
+            return Action::None;
+        }
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_pending(false),
-            KeyCode::Char('f') | KeyCode::Char('F') if self.pending == Pending::Delete => {
-                self.confirm_pending(true)
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if self.high_risk() {
+                    self.confirm_hint = "High risk: type delete, then press Enter.".to_string();
+                    Action::None
+                } else {
+                    self.confirm_pending()
+                }
             }
-            KeyCode::Char('b') if self.pending == Pending::Delete => {
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if matches!(self.pending, Pending::Delete { .. }) =>
+            {
+                if let Pending::Delete { force } = &mut self.pending {
+                    *force = !*force;
+                }
+                self.confirm_buf.clear();
+                self.confirm_hint.clear();
+                self.scroll = 0;
+                Action::None
+            }
+            KeyCode::Char('b') if matches!(self.pending, Pending::Delete { .. }) => {
                 self.branch_scope = self.branch_scope.next();
                 self.confirm_buf.clear();
+                self.confirm_hint.clear();
+                self.scroll = 0;
                 Action::None
             }
             KeyCode::Esc => {
                 self.pending = Pending::None;
                 self.confirm_buf.clear();
+                self.scroll = 0;
                 Action::None
             }
             KeyCode::Char('q') => Action::Quit,
-            KeyCode::Backspace if self.pending == Pending::Delete => {
+            KeyCode::Backspace if matches!(self.pending, Pending::Delete { .. }) => {
                 self.confirm_buf.pop();
                 Action::None
             }
-            KeyCode::Enter if self.pending == Pending::Delete => {
+            KeyCode::Enter if matches!(self.pending, Pending::Delete { .. }) => {
                 if self.confirm_buf.eq_ignore_ascii_case("delete") {
-                    self.confirm_pending(false)
+                    self.confirm_pending()
                 } else {
-                    self.confirm_hint =
-                        "Enter does not delete. press y or type delete.".to_string();
+                    self.confirm_hint = "Type delete, then press Enter.".to_string();
                     Action::None
                 }
             }
-            KeyCode::Char(ch) if self.pending == Pending::Delete => {
-                if ch.is_ascii_alphabetic() {
+            KeyCode::Char(ch) if matches!(self.pending, Pending::Delete { .. }) => {
+                if ch.is_ascii_alphabetic() && self.confirm_buf.len() < 6 {
                     self.confirm_buf.push(ch);
-                    if self.confirm_buf.eq_ignore_ascii_case("delete") {
-                        return self.confirm_pending(false);
-                    }
-                    if self.confirm_buf.len() > 6 {
-                        self.confirm_buf.clear();
-                    }
                 }
                 Action::None
             }
             KeyCode::Enter => {
-                self.confirm_hint = if self.pending == Pending::Clean {
-                    "Enter does not clean. press y.".to_string()
-                } else {
-                    "Enter does not delete. press y or type delete.".to_string()
-                };
+                self.confirm_hint = "Enter does not clean. Press y.".to_string();
                 Action::None
             }
             _ => Action::None,
         }
     }
 
-    fn confirm_pending(&mut self, force: bool) -> Action {
+    fn high_risk(&self) -> bool {
+        matches!(self.pending, Pending::Delete { force: true })
+            || (matches!(self.pending, Pending::Delete { .. })
+                && self.branch_scope != remove::BranchScope::Keep)
+    }
+
+    fn confirm_pending(&mut self) -> Action {
+        if !confirmation_fits(self) {
+            self.confirm_hint = "Resize terminal to review and confirm.".to_string();
+            return Action::None;
+        }
         let pending = self.pending;
         self.pending = Pending::None;
         self.confirm_buf.clear();
+        self.view = View::Browse;
+        self.scroll = 0;
         match pending {
             Pending::Clean => Action::CleanDeps,
-            Pending::Delete => Action::Delete {
+            Pending::Delete { force } => Action::Delete {
                 force,
                 branches: self.branch_scope,
             },
             Pending::None => Action::None,
         }
+    }
+
+    fn scroll_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.scroll = usize::MAX,
+            _ => return false,
+        }
+        true
+    }
+
+    fn on_view_key(&mut self, code: KeyCode) -> Action {
+        if self.scroll_key(code) {
+            return Action::None;
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.open_view(View::Browse),
+            KeyCode::Char('c') if self.view == View::Selected => self.clear_selection(),
+            KeyCode::Char('d') if self.view == View::Selected => self.arm_delete(),
+            KeyCode::Char('x') if self.view == View::Selected => self.arm_clean(),
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn open_view(&mut self, view: View) {
+        self.view = view;
+        self.scroll = 0;
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.scroll = 0;
+        self.note = "selection cleared: 0 selected".to_string();
     }
 
     fn on_browse_key(&mut self, code: KeyCode) -> Action {
@@ -385,6 +465,26 @@ impl App {
                 self.toggle_all_visible();
                 Action::None
             }
+            KeyCode::Char('c') => {
+                self.clear_selection();
+                Action::None
+            }
+            KeyCode::Char('v') => {
+                self.open_view(View::Selected);
+                Action::None
+            }
+            KeyCode::Char('R') => {
+                self.open_view(View::Results);
+                Action::None
+            }
+            KeyCode::Char('?') => {
+                self.open_view(View::Help);
+                Action::None
+            }
+            KeyCode::Enter => {
+                self.open_view(View::Detail);
+                Action::None
+            }
             KeyCode::Char('m') => {
                 self.apply_preset(Query {
                     merged_only: true,
@@ -409,6 +509,7 @@ impl App {
             }
             KeyCode::Char('0') => {
                 self.query = Query::default();
+                self.filter.clear();
                 self.cursor = 0;
                 self.rebuild_visible();
                 self.note = format!("view changed: {} matches", self.visible.len());
@@ -480,21 +581,22 @@ impl App {
     }
 
     fn arm_delete(&mut self) {
-        if self.selected.is_empty() {
+        if self.selected.is_empty() && self.view == View::Browse {
             self.toggle_current();
         }
         if self.selected.is_empty() {
             self.note = "select a worktree to delete".to_string();
             return;
         }
-        self.pending = Pending::Delete;
+        self.pending = Pending::Delete { force: false };
         self.confirm_buf.clear();
         self.confirm_hint.clear();
         self.branch_scope = remove::BranchScope::Keep;
+        self.scroll = 0;
     }
 
     fn arm_clean(&mut self) {
-        if self.selected.is_empty() {
+        if self.selected.is_empty() && self.view == View::Browse {
             self.toggle_current();
         }
         if self.selected.is_empty() {
@@ -504,6 +606,7 @@ impl App {
         self.pending = Pending::Clean;
         self.confirm_buf.clear();
         self.confirm_hint.clear();
+        self.scroll = 0;
     }
 
     fn apply_preset(&mut self, query: Query) {
@@ -602,7 +705,7 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
             }
         }
         if need_draw {
-            terminal.draw(|frame| draw(frame, &app))?;
+            terminal.draw(|frame| draw(frame, &mut app))?;
             need_draw = false;
         }
         let wait = if scan_rx.is_some() {
@@ -613,44 +716,47 @@ pub fn browse(opts: Options) -> anyhow::Result<()> {
         if !event::poll(wait)? {
             continue;
         }
-        while let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Release {
-                if !event::poll(Duration::ZERO)? {
-                    break;
+        loop {
+            match event::read()? {
+                Event::Resize(width, height) => {
+                    app.viewport = Rect::new(0, 0, width, height);
+                    need_draw = true;
                 }
-                continue;
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    match app.on_key(key.code, key.modifiers) {
+                        Action::None => {}
+                        Action::Quit => return Ok(()),
+                        Action::Rescan => {
+                            if scan_rx.is_none() {
+                                app.op = OperationStatus::Running {
+                                    action: ActionKind::Scan,
+                                    total: 0,
+                                };
+                                app.note = "rescanning…".to_string();
+                                scan_started = Instant::now();
+                                last_tick = Instant::now();
+                                scan_rx = Some(spawn_scan(&opts.roots, opts.max_depth));
+                            }
+                        }
+                        Action::Delete { force, branches } => {
+                            if scan_rx.is_some() {
+                                app.note = "wait for scan to finish".to_string();
+                            } else {
+                                run_delete(&mut terminal, &mut app, force, branches)?;
+                            }
+                        }
+                        Action::CleanDeps => {
+                            if scan_rx.is_some() {
+                                app.note = "wait for scan to finish".to_string();
+                            } else {
+                                run_clean(&mut terminal, &mut app)?;
+                            }
+                        }
+                    }
+                    need_draw = true;
+                }
+                _ => {}
             }
-            match app.on_key(key.code, key.modifiers) {
-                Action::None => {}
-                Action::Quit => return Ok(()),
-                Action::Rescan => {
-                    if scan_rx.is_none() {
-                        app.op = OperationStatus::Running {
-                            action: ActionKind::Scan,
-                            total: 0,
-                        };
-                        app.note = "rescanning…".to_string();
-                        scan_started = Instant::now();
-                        last_tick = Instant::now();
-                        scan_rx = Some(spawn_scan(&opts.roots, opts.max_depth));
-                    }
-                }
-                Action::Delete { force, branches } => {
-                    if scan_rx.is_some() {
-                        app.note = "wait for scan to finish".to_string();
-                    } else {
-                        run_delete(&mut terminal, &mut app, force, branches)?;
-                    }
-                }
-                Action::CleanDeps => {
-                    if scan_rx.is_some() {
-                        app.note = "wait for scan to finish".to_string();
-                    } else {
-                        run_clean(&mut terminal, &mut app)?;
-                    }
-                }
-            }
-            need_draw = true;
             if !event::poll(Duration::ZERO)? {
                 break;
             }
@@ -734,22 +840,45 @@ impl Drop for Restore {
     }
 }
 
-fn draw(frame: &mut Frame, app: &App) {
-    let extra = if app.last_result.is_empty() {
-        0
+fn draw(frame: &mut Frame, app: &mut App) {
+    app.viewport = frame.area();
+    if app.pending != Pending::None || app.view != View::Browse {
+        draw_panel(frame, app);
+        return;
+    }
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(4),
+    ])
+    .split(frame.area());
+    let filter = if app.filter_mode {
+        format!("filter edit: {}_", app.filter)
     } else {
-        (app.last_result.len().min(4) as u16).saturating_add(1)
+        format!("filter: {} | text: {:?}", app.query.label(), app.filter)
     };
-    let foot_h = match app.pending {
-        Pending::None if app.scanning() && app.items.is_empty() => 4 + extra,
-        Pending::None if app.filter_mode => 7 + extra,
-        Pending::None => 9 + extra,
-        _ => 14,
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(selection_text(app)), Line::from(filter)]),
+        chunks[0],
+    );
+    draw_table(frame, app, chunks[1]);
+    let lines = if app.filter_mode {
+        vec![
+            Line::from("Enter apply · Esc clear text"),
+            Line::from("Text and preset filters both apply. 0 clears both."),
+            Line::from(app.status_text()),
+        ]
+    } else if app.scanning() && app.items.is_empty() {
+        vec![Line::from("q quit"), Line::from(app.status_text())]
+    } else {
+        vec![
+            Line::from("j/k move · space select · a visible · v selected · c clear"),
+            Line::from("d delete · x clean deps · Enter details · R results · ? help"),
+            Line::from("m merged · i idle · s old+idle · 0 clear · / filter · q quit"),
+            Line::from(app.status_text()),
+        ]
     };
-    let chunks =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(foot_h)]).split(frame.area());
-    draw_table(frame, app, chunks[0]);
-    draw_footer(frame, app, chunks[1]);
+    frame.render_widget(Paragraph::new(lines), chunks[2]);
 }
 
 struct ColumnSpec {
@@ -780,7 +909,7 @@ fn column_spec(width: u16) -> ColumnSpec {
         }
     } else {
         ColumnSpec {
-            headers: vec!["", "id", "repo", "branch", "age", "status"],
+            headers: vec!["", "id", "repo", "branch", "active", "status"],
             widths: vec![
                 Constraint::Length(2),
                 Constraint::Length(8),
@@ -802,11 +931,17 @@ fn draw_table(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         format!("{}/{}", visible.len(), app.items.len())
     };
-    let title = format!(
-        " wtrm  {shown} worktrees · {} selected · {} repos ",
-        app.selected.len(),
-        app.repos
-    );
+    let title = format!(" wtrm  {shown} worktrees · {} repos ", app.repos);
+    if visible.is_empty() {
+        let block = Block::bordered().title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(wrap_lines(vec![Line::from(empty_text(app))], inner.width)),
+            inner,
+        );
+        return;
+    }
     let spec = column_spec(area.width);
     let header = Row::new(spec.headers.clone()).style(Style::new().add_modifier(Modifier::BOLD));
     let rows_h = area.height.saturating_sub(3) as usize;
@@ -876,131 +1011,31 @@ fn row_style(wt: &Worktree, now: i64) -> Style {
     match wt.last_active {
         Some(ts) if now.saturating_sub(ts) >= 86_400 * 14 => Style::new().fg(Color::Red),
         Some(_) => Style::new(),
-        None => Style::new().fg(Color::Red),
+        None => Style::new(),
     }
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let lines = match app.pending {
-        Pending::Delete => confirm_lines(app),
-        Pending::Clean => clean_lines(app),
-        Pending::None if app.filter_mode => filter_lines(app),
-        Pending::None => browse_lines(app),
-    };
-    let title = match app.pending {
-        Pending::Delete => " confirm delete ",
-        Pending::Clean => " confirm clean ",
-        Pending::None if app.filter_mode => " filter ",
-        Pending::None if !app.last_result.is_empty() => " result ",
-        Pending::None => " help ",
-    };
-    let paragraph = Paragraph::new(lines)
-        .block(Block::bordered().title(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
-}
-
-fn filter_lines(app: &App) -> Vec<Line<'static>> {
-    vec![
-        Line::from(format!("filter: {}_", app.filter)),
-        Line::from("Enter apply    Esc clear"),
-        Line::from(app.status_text()),
-    ]
-}
-
-fn browse_lines(app: &App) -> Vec<Line<'static>> {
-    if app.scanning() && app.items.is_empty() {
-        return vec![
-            Line::from(app.status_text()),
-            Line::from("q quit    scanning…"),
-        ];
-    }
-    let detail = match app
+fn selection_text(app: &App) -> String {
+    let shown = app
         .visible()
-        .get(app.cursor)
-        .and_then(|&idx| app.items.get(idx))
-    {
-        Some(wt) => {
-            let when = wt
-                .last_active_utc
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            let created = wt
-                .created_utc
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            format!(
-                "id {}  ·  {}  ·  {}  ·  active {when}  ·  created {created}  ·  {}",
-                wt.id,
-                scan::shorten_path(&wt.path),
-                wt.branch,
-                wt.flags()
-            )
-        }
-        None => "no repos with linked worktrees".to_string(),
-    };
-    let mut lines = vec![
-        Line::from(detail),
-        Line::from(Span::styled(
-            format!(
-                "filter {}. merged means the commit is in the local default branch. squash merges are not detected.",
-                app.query.label()
-            ),
-            Style::new().fg(Color::DarkGray),
-        )),
-        Line::from(app.status_text()),
-    ];
-    lines.extend(result_lines(app));
-    lines.push(Line::from(
-        "m merged   i idle   s old+idle   0 all   x clean deps",
-    ));
-    lines.push(Line::from(
-        "j/k move   space select   a toggle visible   d delete   / filter   r refresh   q quit",
-    ));
-    lines
+        .iter()
+        .filter(|&&idx| app.selected.contains(&app.items[idx].path))
+        .count();
+    format!(
+        "selected: {} · hidden by filters: {}",
+        app.selected.len(),
+        app.selected.len().saturating_sub(shown)
+    )
 }
 
-fn result_lines(app: &App) -> Vec<Line<'static>> {
-    if app.last_result.is_empty() {
-        return Vec::new();
+fn empty_text(app: &App) -> &'static str {
+    if app.scanning() {
+        "Scanning for linked worktrees…"
+    } else if app.items.is_empty() {
+        "No repos with linked worktrees. r rescans. R shows read errors."
+    } else {
+        "No matches. 0 clears all filters. Selected worktrees stay selected."
     }
-    let mut lines = vec![Line::from(Span::styled(
-        "last result:",
-        Style::new().add_modifier(Modifier::BOLD),
-    ))];
-    for text in ops::result_lines(&app.last_result, 4) {
-        lines.push(Line::from(text));
-    }
-    lines
-}
-
-fn clean_lines(app: &App) -> Vec<Line<'static>> {
-    let chosen: Vec<&Worktree> = selected_worktrees(app);
-    let mut lines = vec![
-        Line::from(format!(
-            "clean dependency directories in {} worktrees. the worktrees stay.",
-            chosen.len()
-        )),
-        Line::from(
-            "removes node_modules, target, .next, .turbo, .venv, venv, __pycache__, Pods, .gradle.",
-        ),
-        Line::from("y confirm    Esc cancel    Enter does nothing"),
-    ];
-    if !app.confirm_hint.is_empty() {
-        lines.push(Line::from(app.confirm_hint.clone()));
-    }
-    for wt in chosen.iter().take(6) {
-        lines.push(Line::from(format!(
-            "  {}  {}  {}",
-            wt.id_short(),
-            wt.branch,
-            scan::shorten_path(&wt.path)
-        )));
-    }
-    if chosen.len() > 6 {
-        lines.push(Line::from(format!("  …{} more", chosen.len() - 6)));
-    }
-    lines
 }
 
 fn selected_worktrees(app: &App) -> Vec<&Worktree> {
@@ -1010,43 +1045,365 @@ fn selected_worktrees(app: &App) -> Vec<&Worktree> {
         .collect()
 }
 
-fn confirm_lines(app: &App) -> Vec<Line<'static>> {
+fn selected_lines(app: &App) -> Vec<Line<'static>> {
     let chosen = selected_worktrees(app);
-    let typed = if app.confirm_buf.is_empty() {
-        "type y or delete to confirm".to_string()
-    } else {
-        format!("typed: {}_", app.confirm_buf)
-    };
-    let mut lines = vec![
-        Line::from(format!("delete {} worktrees", chosen.len())),
-        Line::from(format!("branch policy: {}", app.branch_scope.label())),
-        Line::from("y delete clean worktrees"),
-        Line::from("f force delete dirty or locked worktrees"),
-        Line::from("b branch policy: keep → local → GitHub"),
-        Line::from(format!("{typed}    Esc cancel    Enter does nothing")),
-    ];
-    if !app.confirm_hint.is_empty() {
-        lines.push(Line::from(app.confirm_hint.clone()));
-    }
-    for wt in chosen.iter().take(5) {
+    let mut lines = Vec::new();
+    for (i, wt) in chosen.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::default());
+        }
+        let hidden = !app
+            .visible()
+            .iter()
+            .any(|&idx| app.items[idx].path == wt.path);
         lines.push(Line::from(format!(
-            "  {}  {}  {}  {}",
-            wt.id_short(),
+            "{}/{} · {} · {}{}",
+            i + 1,
+            chosen.len(),
+            wt.id,
             wt.flags(),
-            wt.branch,
-            scan::shorten_path(&wt.path)
+            if hidden { " · hidden by filters" } else { "" }
         )));
+        lines.push(Line::from(format!("branch: {}", wt.branch)));
+        lines.push(Line::from(format!("path: {}", wt.path.display())));
     }
-    if chosen.len() > 5 {
-        lines.push(Line::from(format!("  …{} more", chosen.len() - 5)));
+    if chosen.is_empty() {
+        lines.push(Line::from("No selected worktrees."));
     }
     lines
+}
+
+fn confirmation_header(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(selection_text(app))];
+    match app.pending {
+        Pending::Delete { force } => {
+            lines.push(Line::from(
+                "Removes worktree directories via git worktree remove.",
+            ));
+            if force {
+                lines.push(Line::styled(
+                    "FORCE ON: uncommitted changes will be lost.",
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::from("Dirty and locked worktrees may be removed."));
+            } else {
+                lines.push(Line::from(
+                    "Force OFF: existing paths must be clean; locks block.",
+                ));
+            }
+            match app.branch_scope {
+                remove::BranchScope::Keep => {
+                    lines.push(Line::from("Branches KEEP: local and remote branches stay."));
+                }
+                remove::BranchScope::Local => {
+                    lines.push(Line::from("Branches DELETE: local via git branch -D."));
+                    lines.push(Line::from(
+                        "Unmerged commits can lose their branch reference.",
+                    ));
+                    lines.push(Line::from(
+                        "Remote branches and branches still in use stay.",
+                    ));
+                }
+                remove::BranchScope::GitHub => {
+                    lines.push(Line::from(
+                        "Branches DELETE: local and GitHub remote branches.",
+                    ));
+                    lines.push(Line::from(
+                        "Local uses git branch -D, including unmerged branches.",
+                    ));
+                    lines.push(Line::from(
+                        "GitHub uses git push --delete after local deletion.",
+                    ));
+                    lines.push(Line::from(
+                        "Branches still in use stay. Errors appear in results.",
+                    ));
+                }
+            }
+        }
+        Pending::Clean => {
+            lines.push(Line::from("Removes dependency directories recursively."));
+            lines.push(Line::from(
+                "Worktrees and branches stay. Main checkouts stay protected.",
+            ));
+        }
+        Pending::None => {}
+    }
+    lines
+}
+
+fn confirmation_controls(app: &App) -> Vec<Line<'static>> {
+    match app.pending {
+        Pending::Delete { force } => {
+            let mut lines = vec![Line::from(if app.high_risk() {
+                "Type delete then Enter to confirm · Esc cancel"
+            } else {
+                "y confirm · or type delete then Enter · Esc cancel"
+            })];
+            lines.push(Line::from(format!(
+                "f force {} · b branch policy: {}",
+                if force { "off" } else { "on" },
+                app.branch_scope.label()
+            )));
+            lines.push(Line::from(format!(
+                "typed: {}_{}",
+                app.confirm_buf,
+                if app.confirm_hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", app.confirm_hint)
+                }
+            )));
+            lines
+        }
+        Pending::Clean => vec![
+            Line::from("y confirm clean · Esc cancel · Enter does nothing"),
+            Line::from(app.confirm_hint.clone()),
+        ],
+        Pending::None => Vec::new(),
+    }
+}
+
+fn confirmation_fits(app: &App) -> bool {
+    let width = app.viewport.width.saturating_sub(2);
+    let fixed = wrap_lines(confirmation_header(app), width).len()
+        + wrap_lines(confirmation_controls(app), width).len()
+        + wrap_lines(vec![Line::from("j/k scroll · PgUp/PgDn · Home/End")], width).len();
+    app.viewport.width >= 40 && app.viewport.height as usize > fixed + 2
+}
+
+fn detail_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(wt) = app
+        .visible()
+        .get(app.cursor)
+        .and_then(|&idx| app.items.get(idx))
+    else {
+        return vec![Line::from(empty_text(app))];
+    };
+    vec![
+        Line::from(format!("id: {}", wt.id)),
+        Line::from(format!("path: {}", wt.path.display())),
+        Line::from(format!("repo: {}", wt.repo)),
+        Line::from(format!("branch: {}", wt.branch)),
+        Line::from(format!("status: {}", wt.flags())),
+        Line::from(format!("folder: {}", wt.parent.display())),
+        Line::from(format!("main checkout: {}", wt.repo_root.display())),
+        Line::from(format!(
+            "last active: {} · {}",
+            wt.last_active_utc.as_deref().unwrap_or("unknown"),
+            age_label(wt.last_active, app.now)
+        )),
+        Line::from(format!(
+            "created: {}",
+            wt.created_utc.as_deref().unwrap_or("unknown")
+        )),
+    ]
+}
+
+fn result_lines(app: &App) -> Vec<Line<'static>> {
+    let mut items: Vec<_> = app.last_result.iter().collect();
+    items.sort_by_key(|item| match item.result.as_str() {
+        "failed" => 0,
+        "blocked" => 1,
+        _ => 2,
+    });
+    let mut lines = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::default());
+        }
+        lines.push(Line::styled(
+            format!(
+                "{}/{} · {} · {} · id {}",
+                i + 1,
+                items.len(),
+                item.result,
+                item.action,
+                item.id
+            ),
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(format!("path: {}", item.path.display())));
+        if let Some(blocked) = &item.blocked_by {
+            lines.push(Line::from(format!("blocked by: {blocked}")));
+        }
+        lines.push(Line::from(format!("reason: {}", item.reason)));
+    }
+    for (i, error) in app.errors.iter().enumerate() {
+        lines.push(Line::from(format!(
+            "scan error {}/{}: {error}",
+            i + 1,
+            app.errors.len()
+        )));
+        lines.push(Line::default());
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("No operation results or scan errors."));
+    }
+    lines
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    [
+        "Browse and inspect",
+        "j/k or arrows move · PgUp/PgDn page · Home/End first/last",
+        "Enter shows full details · R shows all results and scan errors",
+        "r rescans · q or Esc quits · Ctrl+C quits from any view",
+        "",
+        "Selection",
+        "space toggles the current linked worktree. Main checkouts cannot be selected.",
+        "a toggles deletable rows in the current view. Other selections stay.",
+        "v shows every selected worktree, including those hidden by filters.",
+        "c clears all selections, including hidden selections.",
+        "d reviews deletion · x reviews dependency cleanup",
+        "",
+        "Filters",
+        "/ edits the text filter · Enter applies · Esc clears text",
+        "m merged · i inactive · s old and inactive · 0 clears all filters",
+        "Presets replace the text filter. Filters never change selections.",
+        "Merged means the commit is in the local default branch. Squash merges are not detected.",
+        "",
+        "Review and confirm",
+        "j/k, PgUp/PgDn and Home/End scroll all targets, details and results.",
+        "Esc cancels a confirmation. Esc or q closes a viewer.",
+        "y confirms ordinary deletion or cleanup. Enter alone does nothing.",
+        "f toggles force mode. Uncommitted changes may be lost when force is on.",
+        "b cycles keep, local deletion and local plus GitHub deletion.",
+        "Force or branch deletion requires typing delete, then Enter.",
+        "Changing force or branch policy clears the typed confirmation.",
+    ]
+    .into_iter()
+    .map(Line::from)
+    .collect()
+}
+
+fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut wrapped = Vec::new();
+    for line in lines {
+        for part in line.to_string().split('\n') {
+            let source = Span::raw(part);
+            let mut spans = Vec::new();
+            let mut used = 0;
+            for grapheme in source.styled_graphemes(line.style) {
+                let span = Span::styled(grapheme.symbol.to_owned(), grapheme.style);
+                let size = span.width();
+                if used + size > width as usize && !spans.is_empty() {
+                    wrapped.push(Line::from(std::mem::take(&mut spans)));
+                    used = 0;
+                }
+                used += size;
+                spans.push(span);
+            }
+            wrapped.push(Line::from(spans));
+        }
+    }
+    wrapped
+}
+
+fn draw_panel(frame: &mut Frame, app: &mut App) {
+    let (title, header, content, mut controls) = match app.pending {
+        Pending::Delete { .. } | Pending::Clean => {
+            let title = if app.pending == Pending::Clean {
+                " confirm clean "
+            } else if app.high_risk() {
+                " HIGH RISK delete "
+            } else {
+                " confirm delete "
+            };
+            let mut content = Vec::new();
+            if app.pending == Pending::Clean {
+                content.push(Line::from("Removes node_modules, target, .next, .turbo, .venv, venv, __pycache__, Pods and .gradle, including nested matches."));
+                content.push(Line::default());
+            }
+            content.extend(selected_lines(app));
+            (
+                title,
+                confirmation_header(app),
+                content,
+                confirmation_controls(app),
+            )
+        }
+        Pending::None => match app.view {
+            View::Selected => (
+                " all selected worktrees ",
+                vec![Line::from(selection_text(app))],
+                selected_lines(app),
+                vec![Line::from("c clear all · d delete · x clean · Esc/q back")],
+            ),
+            View::Results => (
+                " all results · failures first ",
+                vec![Line::from(format!(
+                    "{} results · {} succeeded · {} failed or blocked · {} scan errors",
+                    app.last_result.len(),
+                    ops::counts(&app.last_result).0,
+                    ops::counts(&app.last_result).1,
+                    app.errors.len()
+                ))],
+                result_lines(app),
+                vec![Line::from("Esc/q back")],
+            ),
+            View::Detail => (
+                " worktree details ",
+                Vec::new(),
+                detail_lines(app),
+                vec![Line::from("Esc/q back")],
+            ),
+            View::Help | View::Browse => (
+                " help ",
+                Vec::new(),
+                help_lines(),
+                vec![Line::from("Esc/q back")],
+            ),
+        },
+    };
+    controls.push(Line::from("j/k scroll · PgUp/PgDn · Home/End"));
+    let block = Block::bordered().title(title);
+    let inner = block.inner(frame.area());
+    let header = wrap_lines(header, inner.width);
+    let controls = wrap_lines(controls, inner.width);
+    if inner.height as usize <= header.len() + controls.len() || inner.width < 38 {
+        frame.render_widget(block, frame.area());
+        let message = if app.pending == Pending::None {
+            "Resize terminal to view full content.\nEsc/q back."
+        } else {
+            "Resize terminal to review and confirm.\nConfirmation disabled. Esc cancels."
+        };
+        frame.render_widget(
+            Paragraph::new(wrap_lines(vec![Line::from(message)], inner.width)),
+            inner,
+        );
+        return;
+    }
+    let areas = Layout::vertical([
+        Constraint::Length(header.len() as u16),
+        Constraint::Min(1),
+        Constraint::Length(controls.len() as u16),
+    ])
+    .split(inner);
+    let content = wrap_lines(content, inner.width);
+    app.scroll = app
+        .scroll
+        .min(content.len().saturating_sub(areas[1].height as usize));
+    let end = (app.scroll + areas[1].height as usize).min(content.len());
+    let block = block.title_bottom(format!(
+        " lines {}-{}/{} ",
+        app.scroll + 1,
+        end,
+        content.len()
+    ));
+    frame.render_widget(block, frame.area());
+    frame.render_widget(Paragraph::new(header), areas[0]);
+    frame.render_widget(Paragraph::new(content[app.scroll..end].to_vec()), areas[1]);
+    frame.render_widget(Paragraph::new(controls), areas[2]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scan::fixture;
+    use ratatui::{backend::TestBackend, Terminal};
 
     fn app_with(items: Vec<Worktree>) -> App {
         App::from_scan(
@@ -1057,6 +1414,51 @@ mod tests {
             },
             "~/project".to_string(),
         )
+    }
+
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn scroll_screens(app: &mut App, width: u16, height: u16) -> String {
+        app.on_key(KeyCode::Home, KeyModifiers::NONE);
+        let mut screens = render(app, width, height);
+        loop {
+            let before = app.scroll;
+            app.on_key(KeyCode::Down, KeyModifiers::NONE);
+            let screen = render(app, width, height);
+            if app.scroll == before {
+                break;
+            }
+            screens.push('\n');
+            screens.push_str(&screen);
+        }
+        screens
+    }
+
+    fn long_worktrees() -> Vec<Worktree> {
+        (1..=8)
+            .map(|i| {
+                fixture(
+                    &format!(
+                        "/repos/demo/.worktrees/{i:02}/{}TAIL{i:02}",
+                        "long-directory/".repeat(26)
+                    ),
+                    "demo",
+                    false,
+                    Some(10),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -1072,7 +1474,7 @@ mod tests {
         assert_eq!(app.selected.len(), 1);
         assert!(app.note.contains("selection changed"));
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
-        assert_eq!(app.pending, Pending::Delete);
+        assert_eq!(app.pending, Pending::Delete { force: false });
         assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
         assert_eq!(
             app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
@@ -1086,6 +1488,16 @@ mod tests {
         app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
         assert_eq!(
             app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
+            Action::None
+        );
+        for ch in "delete".chars() {
+            assert_eq!(
+                app.on_key(KeyCode::Char(ch), KeyModifiers::NONE),
+                Action::None
+            );
+        }
+        assert_eq!(
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
             Action::Delete {
                 force: false,
                 branches: remove::BranchScope::GitHub,
@@ -1094,39 +1506,26 @@ mod tests {
     }
 
     #[test]
-    fn typing_delete_confirms() {
-        let mut app = app_with(vec![
-            fixture("/repos/demo", "demo", true, Some(10)),
-            fixture("/repos/demo/.worktrees/feat", "demo", false, Some(10)),
-        ]);
-        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
+    fn typing_delete_requires_enter() {
+        let mut app = app_with(vec![fixture(
+            "/repos/demo/.worktrees/feat",
+            "demo",
+            false,
+            Some(10),
+        )]);
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        for ch in "delete".chars() {
+            assert_eq!(
+                app.on_key(KeyCode::Char(ch), KeyModifiers::NONE),
+                Action::None
+            );
+        }
+        assert_eq!(app.pending, Pending::Delete { force: false });
         assert_eq!(
-            app.on_key(KeyCode::Char('d'), KeyModifiers::NONE),
-            Action::None
-        );
-        assert_eq!(
-            app.on_key(KeyCode::Char('e'), KeyModifiers::NONE),
-            Action::None
-        );
-        assert_eq!(
-            app.on_key(KeyCode::Char('l'), KeyModifiers::NONE),
-            Action::None
-        );
-        assert_eq!(
-            app.on_key(KeyCode::Char('e'), KeyModifiers::NONE),
-            Action::None
-        );
-        assert_eq!(
-            app.on_key(KeyCode::Char('t'), KeyModifiers::NONE),
-            Action::None
-        );
-        assert_eq!(
-            app.on_key(KeyCode::Char('e'), KeyModifiers::NONE),
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
             Action::Delete {
                 force: false,
-                branches: remove::BranchScope::Keep,
+                branches: remove::BranchScope::Keep
             }
         );
     }
@@ -1218,9 +1617,24 @@ mod tests {
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
         assert_eq!(
             app.on_key(KeyCode::Char('f'), KeyModifiers::NONE),
+            Action::None
+        );
+        assert_eq!(app.pending, Pending::Delete { force: true });
+        assert_eq!(
+            app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
+            Action::None
+        );
+        for ch in "delete".chars() {
+            assert_eq!(
+                app.on_key(KeyCode::Char(ch), KeyModifiers::NONE),
+                Action::None
+            );
+        }
+        assert_eq!(
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
             Action::Delete {
                 force: true,
-                branches: remove::BranchScope::Keep,
+                branches: remove::BranchScope::Keep
             }
         );
     }
@@ -1267,8 +1681,8 @@ mod tests {
         app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
         app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
         assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
-        assert!(app.confirm_hint.contains("Enter does not delete"));
-        assert_eq!(app.pending, Pending::Delete);
+        assert!(app.confirm_hint.contains("Type delete"));
+        assert_eq!(app.pending, Pending::Delete { force: false });
     }
 
     #[test]
@@ -1288,7 +1702,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(app.last_result.len(), 1);
-        assert!(app.note.contains("succeeded"));
+        assert_eq!(app.status_text(), "finished: 1 succeeded");
         assert_eq!(
             app.op,
             OperationStatus::Finished {
@@ -1313,8 +1727,13 @@ mod tests {
             "blocked",
         )]);
         assert_eq!(app.items.len(), 2);
-        assert!(app.note.contains("blocked"));
-        assert!(app.note.contains("dirty"));
+        assert_eq!(
+            app.status_text(),
+            "finished: 0 succeeded, 1 failed or blocked"
+        );
+        assert!(result_lines(&app)
+            .iter()
+            .any(|line| line.to_string().contains("dirty")));
         assert_eq!(app.last_result[0].result, "blocked");
     }
 
@@ -1353,5 +1772,263 @@ mod tests {
         app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
         assert_eq!(app.selected.len(), 1);
+    }
+
+    #[test]
+    fn hidden_selections_are_counted_reviewed_and_cleared_globally() {
+        for (width, height) in [(60, 16), (80, 24), (140, 32)] {
+            let mut app = app_with(long_worktrees());
+            app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+            for ch in "TAIL01".chars() {
+                app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+            }
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+            let screen = render(&mut app, width, height);
+            assert!(
+                screen.contains("selected: 8 · hidden by filters: 7"),
+                "{screen}"
+            );
+            assert!(screen.contains("TAIL01"), "{screen}");
+            assert_eq!(app.selected.len(), 8);
+
+            app.on_key(KeyCode::Char('v'), KeyModifiers::NONE);
+            let screens = scroll_screens(&mut app, width, height);
+            assert!(screens.contains("8/8 ·"), "{screens}");
+            assert!(screens.contains("TAIL08"), "{screens}");
+            app.on_key(KeyCode::End, KeyModifiers::NONE);
+            let end = render(&mut app, width, height);
+            assert!(end.contains("TAIL08"), "{end}");
+            app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+            let cleared = render(&mut app, width, height);
+            assert!(
+                cleared.contains("selected: 0 · hidden by filters: 0"),
+                "{cleared}"
+            );
+            assert!(cleared.contains("No selected worktrees."), "{cleared}");
+            assert_eq!(app.visible().len(), 1);
+        }
+    }
+
+    #[test]
+    fn confirmation_keeps_risks_and_controls_visible_while_every_target_scrolls() {
+        for (width, height) in [(60, 16), (80, 24), (140, 32)] {
+            let mut app = app_with(long_worktrees());
+            app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+            app.filter = "TAIL01".to_string();
+            app.clamp_cursor();
+            app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('f'), KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+            let first = render(&mut app, width, height);
+            assert!(first.contains("HIGH RISK delete"), "{first}");
+            assert!(
+                first.contains("uncommitted changes will be lost"),
+                "{first}"
+            );
+            assert!(first.contains("GitHub uses git push --delete"), "{first}");
+            assert!(first.contains("Type delete then Enter"), "{first}");
+            assert!(confirmation_fits(&app));
+            let screens = scroll_screens(&mut app, width, height);
+            assert!(screens.contains("8/8 ·"), "{screens}");
+            assert!(screens.contains("TAIL08"), "{screens}");
+            app.on_key(KeyCode::End, KeyModifiers::NONE);
+            let end = render(&mut app, width, height);
+            assert!(end.contains("TAIL08"), "{end}");
+            assert!(end.contains("uncommitted changes will be lost"), "{end}");
+            assert!(end.contains("Type delete then Enter"), "{end}");
+            assert!(app.confirm_buf.is_empty());
+            assert_eq!(
+                app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
+                Action::None
+            );
+            assert_eq!(app.pending, Pending::Delete { force: true });
+        }
+    }
+
+    #[test]
+    fn clean_confirmation_scrolls_every_target_and_keeps_consequences_visible() {
+        for (width, height) in [(60, 16), (80, 24), (140, 32)] {
+            let mut app = app_with(long_worktrees());
+            app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+            let first = render(&mut app, width, height);
+            assert!(
+                first.contains("dependency directories recursively"),
+                "{first}"
+            );
+            assert!(first.contains("Worktrees and branches stay"), "{first}");
+            assert!(first.contains("y confirm clean"), "{first}");
+            let screens = scroll_screens(&mut app, width, height);
+            assert!(screens.contains(".gradle"), "{screens}");
+            assert!(screens.contains("8/8 ·"), "{screens}");
+            app.on_key(KeyCode::End, KeyModifiers::NONE);
+            let end = render(&mut app, width, height);
+            assert!(end.contains("TAIL08"), "{end}");
+            assert!(end.contains("Worktrees and branches stay"), "{end}");
+            assert!(end.contains("y confirm clean"), "{end}");
+            assert_eq!(app.pending, Pending::Clean);
+        }
+    }
+
+    #[test]
+    fn high_risk_policy_changes_invalidate_typed_confirmation() {
+        let mut app = app_with(long_worktrees());
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        for ch in "delete".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(app.confirm_buf, "");
+        assert!(app.high_risk());
+        assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
+        for ch in "delete".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.confirm_buf, "");
+        assert_eq!(
+            app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
+            Action::None
+        );
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(app.branch_scope, remove::BranchScope::Keep);
+        assert_eq!(app.pending, Pending::Delete { force: false });
+    }
+
+    #[test]
+    fn too_small_confirmation_is_explicit_and_cannot_execute() {
+        let mut app = app_with(long_worktrees());
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let screen = render(&mut app, 40, 8);
+        assert!(screen.contains("Resize terminal"), "{screen}");
+        assert!(screen.contains("Confirmation disabled"), "{screen}");
+        assert_eq!(
+            app.on_key(KeyCode::Char('y'), KeyModifiers::NONE),
+            Action::None
+        );
+        for ch in "delete".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert_eq!(app.on_key(KeyCode::Enter, KeyModifiers::NONE), Action::None);
+        render(&mut app, 80, 24);
+        assert_eq!(
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            Action::Delete {
+                force: false,
+                branches: remove::BranchScope::Keep
+            }
+        );
+    }
+
+    #[test]
+    fn zero_clears_text_and_preset_and_empty_states_differ() {
+        let mut app = app_with(long_worktrees());
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('m'), KeyModifiers::NONE);
+        app.filter = "no-such-worktree".to_string();
+        app.clamp_cursor();
+        let no_match = render(&mut app, 60, 16);
+        assert!(no_match.contains("No matches."), "{no_match}");
+        assert!(no_match.contains("no-such-worktree"), "{no_match}");
+        app.on_key(KeyCode::Char('0'), KeyModifiers::NONE);
+        let reset = render(&mut app, 60, 16);
+        assert!(reset.contains("filter: all | text: \"\""), "{reset}");
+        assert_eq!(app.visible().len(), 8);
+        assert_eq!(app.selected.len(), 8);
+        let empty = render(&mut app_with(Vec::new()), 60, 16);
+        assert!(empty.contains("No repos with linked worktrees."), "{empty}");
+    }
+
+    #[test]
+    fn results_render_failures_first_and_scroll_past_four_full_errors() {
+        for (width, height) in [(60, 16), (80, 24), (140, 32)] {
+            let mut app = app_with(long_worktrees());
+            let items = app
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, wt)| {
+                    ActionItem::new(
+                        "delete",
+                        wt,
+                        format!(
+                            "cannot remove\n{}RESULT{:02}_END",
+                            "long error ".repeat(30),
+                            i + 1
+                        ),
+                        None,
+                        if i == 7 { "failed" } else { "ok" },
+                    )
+                })
+                .collect();
+            app.apply_mutate_result(items);
+            let first = render(&mut app, width, height);
+            assert!(first.contains("1/8 · failed · delete"), "{first}");
+            assert_eq!(first.matches("7 succeeded").count(), 1, "{first}");
+            assert_eq!(first.matches("1 failed or blocked").count(), 1, "{first}");
+            let screens = scroll_screens(&mut app, width, height);
+            for i in 1..=8 {
+                assert!(
+                    screens.contains(&format!("RESULT{i:02}_END")),
+                    "missing result {i}"
+                );
+            }
+            app.on_key(KeyCode::End, KeyModifiers::NONE);
+            let end = render(&mut app, width, height);
+            assert!(end.contains("RESULT07_END"), "{end}");
+            app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('R'), KeyModifiers::NONE);
+            let reopened = render(&mut app, width, height);
+            assert!(reopened.contains("1/8 · failed · delete"), "{reopened}");
+        }
+    }
+
+    #[test]
+    fn details_and_scan_errors_keep_long_paths_and_multiline_errors() {
+        for (width, height) in [(60, 16), (80, 24), (140, 32)] {
+            let mut app = app_with(long_worktrees());
+            app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+            let screens = scroll_screens(&mut app, width, height);
+            assert!(screens.contains("TAIL01"), "{screens}");
+            assert!(screens.contains("last active:"), "{screens}");
+            app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+            app.errors = vec![format!(
+                "cannot read\n{}SCAN_ERROR_END",
+                "long error ".repeat(30)
+            )];
+            app.on_key(KeyCode::Char('R'), KeyModifiers::NONE);
+            let screens = scroll_screens(&mut app, width, height);
+            assert!(screens.contains("cannot read"), "{screens}");
+            assert!(screens.contains("SCAN_ERROR_END"), "{screens}");
+        }
+    }
+
+    #[test]
+    fn clean_result_keeps_worktree_and_selection() {
+        let mut app = app_with(long_worktrees());
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.apply_mutate_result(vec![ActionItem::new(
+            "clean",
+            &app.items[0],
+            "removed target",
+            None,
+            "ok",
+        )]);
+        assert_eq!(app.items.len(), 8);
+        assert_eq!(app.selected.len(), 8);
+        assert_eq!(app.status_text(), "finished: 1 succeeded");
+    }
+
+    #[test]
+    fn unknown_activity_is_neutral_and_column_name_is_consistent() {
+        let unknown = fixture("/repos/demo/.worktrees/unknown", "demo", false, None);
+        let old = fixture("/repos/demo/.worktrees/old", "demo", false, Some(1));
+        assert_eq!(row_style(&unknown, 30 * 86_400), Style::new());
+        assert_eq!(row_style(&old, 30 * 86_400).fg, Some(Color::Red));
+        assert!(column_spec(60).headers.contains(&"active"));
+        assert!(column_spec(140).headers.contains(&"active"));
     }
 }
