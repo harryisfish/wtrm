@@ -66,7 +66,18 @@ pub fn delete_many(
         let Some(wt) = items.iter().find(|wt| &wt.path == path) else {
             continue;
         };
-        let error = delete_one(wt, force, expected_head).err();
+        let error = if force
+            && expected_head.is_some()
+            && wt.deletable()
+            && wt.path != wt.repo_root
+            && items
+                .iter()
+                .any(|other| other.path != wt.path && other.path.starts_with(&wt.path))
+        {
+            Some("registered nested worktree".to_string())
+        } else {
+            delete_one(wt, force, expected_head).err()
+        };
         if error.is_none() {
             removed.push(wt);
         }
@@ -92,36 +103,7 @@ pub fn delete_one(wt: &Worktree, force: bool, expected_head: Option<&str>) -> Re
     }
 
     if let Some(expected) = expected_head {
-        let mut cmd = crate::git::command();
-        cmd.arg("-C").arg(&wt.path).args(["rev-parse", "HEAD"]);
-        let current = crate::git::stdout_text(cmd, crate::git::QUICK)?;
-        if current != expected || wt.head != expected {
-            return Err("worktree HEAD changed before deletion".to_string());
-        }
-        let mut cmd = crate::git::command();
-        cmd.arg("-C")
-            .arg(&wt.path)
-            .args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-        if crate::git::stdout_text(cmd, crate::git::QUICK)? != wt.branch {
-            return Err("worktree branch changed before deletion".to_string());
-        }
-        let mut cmd = crate::git::command();
-        cmd.arg("-C").arg(&wt.path).args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=normal",
-            "--ignore-submodules=none",
-        ]);
-        let out = crate::git::output(cmd, crate::git::QUICK)?;
-        if !out.status.success() || !out.stdout.is_empty() {
-            return Err("worktree is not clean before deletion".to_string());
-        }
-        let mut cmd = crate::git::command();
-        cmd.arg("-C").arg(&wt.path).args(["rev-parse", "HEAD"]);
-        if crate::git::stdout_text(cmd, crate::git::QUICK)? != expected {
-            return Err("worktree HEAD changed before deletion".to_string());
-        }
+        check_expected_head(wt, expected, force)?;
     }
     if !force {
         if wt.locked {
@@ -136,7 +118,10 @@ pub fn delete_one(wt: &Worktree, force: bool, expected_head: Option<&str>) -> Re
     let mut cmd = git_at(wt);
     cmd.args(["worktree", "remove"]);
     if force {
-        cmd.args(["--force", "--force"]);
+        cmd.arg("--force");
+        if expected_head.is_none() {
+            cmd.arg("--force");
+        }
     }
     cmd.arg(&wt.path);
     let out = crate::git::output(cmd, crate::git::REMOVE)?;
@@ -144,6 +129,63 @@ pub fn delete_one(wt: &Worktree, force: bool, expected_head: Option<&str>) -> Re
         return Ok(());
     }
     Err(git_err(&out, "git worktree remove failed"))
+}
+
+pub fn check_expected_head(wt: &Worktree, expected: &str, force: bool) -> Result<(), String> {
+    if wt.locked || wt.missing || wt.dirty.is_none() {
+        return Err("locked, missing, or unknown worktree state".to_string());
+    }
+    let mut cmd = crate::git::command();
+    cmd.arg("-C").arg(&wt.path).args(["rev-parse", "HEAD"]);
+    let current = crate::git::stdout_text(cmd, crate::git::QUICK)?;
+    if current != expected || wt.head != expected {
+        return Err("worktree HEAD changed before deletion".to_string());
+    }
+    let mut cmd = crate::git::command();
+    cmd.arg("-C")
+        .arg(&wt.path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    if crate::git::stdout_text(cmd, crate::git::QUICK)? != wt.branch {
+        return Err("worktree branch changed before deletion".to_string());
+    }
+    let mut cmd = crate::git::command();
+    cmd.arg("-C").arg(&wt.path).args([
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+    ]);
+    let out = crate::git::output(cmd, crate::git::QUICK)?;
+    if !out.status.success() {
+        return Err("cannot determine worktree status before deletion".to_string());
+    }
+    if !force && !out.stdout.is_empty() {
+        return Err("worktree is not clean before deletion".to_string());
+    }
+    if force {
+        let mut cmd = crate::git::command();
+        cmd.arg("-C")
+            .arg(&wt.path)
+            .args(["ls-files", "--stage", "-z"]);
+        let out = crate::git::output(cmd, crate::git::QUICK)?;
+        if !out.status.success() {
+            return Err("cannot check worktree submodules".to_string());
+        }
+        if out
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.starts_with(b"160000 "))
+        {
+            return Err("worktree contains submodules".to_string());
+        }
+    }
+    let mut cmd = crate::git::command();
+    cmd.arg("-C").arg(&wt.path).args(["rev-parse", "HEAD"]);
+    if crate::git::stdout_text(cmd, crate::git::QUICK)? != expected {
+        return Err("worktree HEAD changed before deletion".to_string());
+    }
+    Ok(())
 }
 
 pub fn find_deps(root: &Path) -> Result<Vec<PathBuf>, String> {
