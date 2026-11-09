@@ -53,13 +53,15 @@ def main():
                         help="inactivity threshold, combined with creation age using OR")
     parser.add_argument("--interval", default="1h", help="run interval (default: 1h)")
     parser.add_argument("--include-cache", action="store_true", help="also reclaim old Turbo cache")
+    parser.add_argument("--discard-stale", action="store_true",
+                        help="discard age-matched worktrees, including uncommitted and ignored files, without requiring a merged PR")
     args = parser.parse_args()
     interval = MAINTENANCE.duration(args.interval)
     ages = {name: MAINTENANCE.duration(getattr(args, name)) if getattr(args, name) is not None else None
             for name in ("created_before", "inactive")}
     config = MAINTENANCE.Config(args.root, args.mount, args.volume_uuid, args.wtrm,
                                 args.codex_db, args.report_dir,
-                                **ages, reclaim_cache=args.include_cache)
+                                **ages, reclaim_cache=args.include_cache, discard_stale=args.discard_stale)
     binary = MAINTENANCE.safe_path(args.wtrm)
     help_text = subprocess.run([str(binary), "delete", "--help"], check=True,
                                capture_output=True, text=True).stdout
@@ -81,7 +83,8 @@ def main():
     data = {"root": str(args.root), "mount": str(args.mount), "volume_uuid": args.volume_uuid,
             "wtrm": str(installed_binary), "codex_db": str(args.codex_db),
             "report_dir": str(args.report_dir), "created_before": args.created_before,
-            "inactive": args.inactive, "reclaim_cache": args.include_cache}
+            "inactive": args.inactive, "reclaim_cache": args.include_cache,
+            "discard_stale": args.discard_stale}
     replace_file(config_path, (json.dumps(data, indent=2) + "\n").encode(), 0o600)
     agent = Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
     plist = {"Label": LABEL,
@@ -93,6 +96,7 @@ def main():
     replace_file(agent, plistlib.dumps(plist), 0o600)
     print(json.dumps({"installed": str(install), "config": str(config_path),
                       "launch_agent": str(agent), "loaded": False,
+                      "discard_stale": args.discard_stale,
                       "dry_run": [str(installed_binary), "maintain", "--config", str(config_path)]},
                      indent=2))
 

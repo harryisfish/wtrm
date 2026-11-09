@@ -55,10 +55,21 @@ pub fn delete_targets(
     } else {
         for wt in targets {
             let mut item = describe_delete(wt, force, "dry-run");
-            if expected_head.is_some_and(|head| wt.head != head) {
-                item.result = "blocked".to_string();
-                item.blocked_by = Some("HEAD changed".to_string());
-                item.reason = "worktree HEAD does not match --expected-head".to_string();
+            if let Some(head) = expected_head.filter(|_| item.blocked_by.is_none()) {
+                let check = if force
+                    && worktrees
+                        .iter()
+                        .any(|other| other.path != wt.path && other.path.starts_with(&wt.path))
+                {
+                    Err("registered nested worktree".to_string())
+                } else {
+                    remove::check_expected_head(wt, head, force)
+                };
+                if let Err(reason) = check {
+                    item.result = "blocked".to_string();
+                    item.blocked_by = Some(reason.clone());
+                    item.reason = reason;
+                }
             }
             items.push(item);
         }

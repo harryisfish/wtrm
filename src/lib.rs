@@ -123,7 +123,7 @@ struct DeleteArgs {
     #[arg(long, default_value = "keep", value_parser = parse_branches)]
     branches: BranchScope,
 
-    /// Refuse deletion unless this single worktree still has the given commit
+    /// Require this single worktree's commit; with --force, preserve locked or unknown worktrees
     #[arg(long)]
     expected_head: Option<String>,
 }
@@ -255,8 +255,8 @@ fn run_plan(cli: &Cli) -> anyhow::Result<()> {
 fn run_delete(cli: &Cli, args: &DeleteArgs) -> anyhow::Result<()> {
     require_targets(&args.path, &args.id)?;
     if let Some(head) = &args.expected_head {
-        if args.path.len() + args.id.len() != 1 || args.force {
-            bail!("--expected-head requires one target and cannot be used with --force");
+        if args.path.len() + args.id.len() != 1 {
+            bail!("--expected-head requires one target");
         }
         if !matches!(head.len(), 40 | 64) || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("--expected-head requires a full commit hash");

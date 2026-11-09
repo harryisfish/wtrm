@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reclaim old, merged worktrees and cold Turbo cache entries on one volume."""
+"""Reclaim old worktrees and cold Turbo cache entries on one volume."""
 
 import argparse
 import contextlib
@@ -126,6 +126,7 @@ class Config:
     created_before: int = WORKTREE_AGE
     inactive: int = None
     reclaim_cache: bool = True
+    discard_stale: bool = False
     config_path: Path = None
 
     def __post_init__(self):
@@ -134,14 +135,15 @@ class Config:
         if any(value is not None and (type(value) is not int or not 0 < value <= MAX_DURATION)
                for value in (self.created_before, self.inactive)):
             raise Unsafe("invalid worktree age threshold")
-        if type(self.reclaim_cache) is not bool:
-            raise Unsafe("reclaim_cache must be a boolean")
+        for name in ("reclaim_cache", "discard_stale"):
+            if type(getattr(self, name)) is not bool:
+                raise Unsafe(name + " must be a boolean")
 
     @classmethod
     def read(cls, path):
         data = json.loads(safe_path(path).read_text())
         fields = ("root", "mount", "volume_uuid", "wtrm", "codex_db", "report_dir")
-        optional = {"created_before", "inactive", "reclaim_cache"}
+        optional = {"created_before", "inactive", "reclaim_cache", "discard_stale"}
         if (not isinstance(data, dict) or not set(fields) <= set(data)
                 or set(data) - set(fields) - optional
                 or not all(isinstance(data[k], str) for k in fields)):
@@ -150,7 +152,8 @@ class Config:
                 for name, default in (("created_before", "7d"), ("inactive", None))}
         return cls(Path(data["root"]), Path(data["mount"]), data["volume_uuid"],
                    Path(data["wtrm"]), Path(data["codex_db"]), Path(data["report_dir"]),
-                   **ages, reclaim_cache=data.get("reclaim_cache", True), config_path=Path(path))
+                   **ages, reclaim_cache=data.get("reclaim_cache", True),
+                   discard_stale=data.get("discard_stale", False), config_path=Path(path))
 
     def matches_age(self, row, now):
         return any(age is not None and type(stamp) in (int, float)
@@ -314,11 +317,13 @@ def merged_pr(path, branch, head):
     raise Unsafe("no merged pull request matches the exact branch and HEAD")
 
 
-def clean_head(path, branch, head):
+def check_head(path, branch, head, discard_stale=False):
     if text(git(path, "rev-parse", "HEAD")) != head:
         raise Unsafe("HEAD changed")
     if text(git(path, "symbolic-ref", "--quiet", "--short", "HEAD")) != branch:
         raise Unsafe("branch changed")
+    if discard_stale:
+        return
     if git(path, "status", "--porcelain=v1", "-z", "--untracked-files=normal",
            "--ignore-submodules=none").stdout:
         raise Unsafe("worktree has uncommitted content")
@@ -385,8 +390,10 @@ def reclaim_worktrees(config, worktrees, now, apply):
                 raise Unsafe("unknown worktree state")
             if row.get("main") or row.get("bare") or row.get("locked") or row.get("missing"):
                 raise Unsafe("main, bare, locked, or missing worktree")
-            if row.get("dirty") is not False:
-                raise Unsafe("worktree has uncommitted content or status is unknown")
+            if type(row.get("dirty")) is not bool:
+                raise Unsafe("worktree status is unknown")
+            if row["dirty"] and not config.discard_stale:
+                raise Unsafe("worktree has uncommitted content")
             if not config.matches_age(row, now):
                 raise Unsafe("no enabled age threshold matches; unknown ages do not match")
             path = config.bound(path)
@@ -407,13 +414,14 @@ def reclaim_worktrees(config, worktrees, now, apply):
             reason = session_reason(path, sessions)
             if reason:
                 raise Unsafe(reason)
-            clean_head(path, branch, head)
-            merged_pr(path, branch, head)
+            check_head(path, branch, head, config.discard_stale)
+            if not config.discard_stale:
+                merged_pr(path, branch, head)
             check_contents(path)
             activity = Activity.capture(config)
             if activity.uses_tree(path) or activity.uses_tree(Path(row["git_common_dir"])):
                 raise Unsafe("worktree is in use")
-            clean_head(path, branch, head)
+            check_head(path, branch, head, config.discard_stale)
             current_sessions = session_paths(config, now)
             reason = session_reason(path, current_sessions)
             if reason:
@@ -422,13 +430,20 @@ def reclaim_worktrees(config, worktrees, now, apply):
             activity.fresh()
             args = [str(config.wtrm), "delete", "--id", row["id"], "--expected-head", head,
                     "--branches", "keep", "--json", "--yes" if apply else "--dry-run", str(config.root)]
-            result = json.loads(command(args, timeout=600).stdout)
+            if config.discard_stale:
+                args.append("--force")
+            response = command(args, check=False, timeout=600)
+            result = json.loads(response.stdout)
             items = result.get("items", [])
             expected = "ok" if apply else "dry-run"
-            if (result.get("errors") or len(items) != 1 or items[0].get("result") != expected
+            if (result.get("errors") or len(items) != 1
                     or Path(items[0].get("path", "")) != path):
                 raise Unsafe("wtrm refused or returned an incomplete delete result")
+            if response.returncode or items[0].get("result") != expected:
+                raise Unsafe("wtrm refused deletion: " + str(items[0].get("reason", "unknown result")))
             item.update(action="removed" if apply else "would_remove", head=head)
+            if config.discard_stale:
+                item["reason"] = "age threshold matched; discard_stale permits uncommitted and ignored content loss"
         except (Unsafe, OSError, ValueError, KeyError) as error:
             item["reason"] = str(error)
     return results
@@ -601,7 +616,8 @@ def run(config, apply=False, now=None):
     result = {"started_at": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
               "apply": apply, "worktrees": [], "caches": [], "errors": [],
               "worktree_policy": {"created_before_seconds": config.created_before,
-                                  "inactive_seconds": config.inactive, "match": "any"},
+                                  "inactive_seconds": config.inactive, "match": "any",
+                                  "discard_stale": config.discard_stale},
               "reclaim_cache": config.reclaim_cache,
               "activity_scope": "canonical session cwd and open files; later cross-cwd use cannot be inferred"}
     try:

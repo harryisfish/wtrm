@@ -225,6 +225,68 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
         self.assertEqual((self.repo / "source.txt").read_text(), "source\n")
 
+    def test_discard_stale_removes_local_content_without_a_merged_pr(self):
+        self.config.discard_stale = True
+        self.config.reclaim_cache = False
+        old = self.git(self.linked, "rev-parse", "HEAD")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/topic", old)
+        self.git(self.linked, "branch", "--set-upstream-to=origin/topic")
+        self.git(self.linked, "commit", "--allow-empty", "-m", "unpushed")
+        self.git(self.repo, "remote", "remove", "origin")
+        self.ignore(".env.local")
+        files = {"source.txt": "discard tracked edit\n", "untracked.txt": "discard untracked\n",
+                 ".env.local": "discard ignored fixture\n"}
+        for name, content in files.items():
+            (self.linked / name).write_text(content)
+        with patch.object(M, "merged_pr", side_effect=AssertionError("GitHub is not required")):
+            result = self.run_maintenance()
+            self.assertEqual(self.target_result(result)["action"], "would_remove", result)
+            self.assertTrue(result["worktree_policy"]["discard_stale"])
+            for name, content in files.items():
+                self.assertEqual((self.linked / name).read_text(), content)
+            result = self.run_maintenance(True)
+        self.assertEqual(self.target_result(result)["action"], "removed", result)
+        self.assertIn("content loss", self.target_result(result)["reason"])
+        self.assertFalse(self.linked.exists())
+        self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
+        self.assertEqual((self.repo / "source.txt").read_text(), "source\n")
+
+    def test_discard_stale_keeps_age_and_safety_guards(self):
+        self.config.discard_stale = True
+        self.config.reclaim_cache = False
+        (self.linked / "source.txt").write_text("discardable edit\n")
+        self.config.created_before = None
+        self.config.inactive = 30 * 86400
+        result = self.run_maintenance(True)
+        self.assertIn("no enabled age threshold", self.target_result(result)["reason"])
+        self.config.inactive = 7 * 86400
+        self.git(self.repo, "worktree", "lock", str(self.linked))
+        result = self.run_maintenance(True)
+        self.assertIn("locked", self.target_result(result)["reason"])
+        self.git(self.repo, "worktree", "unlock", str(self.linked))
+        self.open_paths = [self.linked / "source.txt"]
+        result = self.run_maintenance(True)
+        self.assertIn("in use", self.target_result(result)["reason"])
+        self.open_paths = []
+        with sqlite3.connect(self.database) as db:
+            db.execute("INSERT INTO threads VALUES (?,?,?,?,?)", (str(self.linked), 1, 1, 0, 0))
+        result = self.run_maintenance(True)
+        self.assertIn("session", self.target_result(result)["reason"])
+        with sqlite3.connect(self.database) as db:
+            db.execute("DELETE FROM threads")
+        for name in ("planning", ".planning"):
+            directory = self.linked / name
+            directory.mkdir()
+            result = self.run_maintenance(True)
+            self.assertIn("planning", self.target_result(result)["reason"])
+            directory.rmdir()
+        nested = self.linked / "node_modules/nested"
+        nested.mkdir(parents=True)
+        self.git(nested, "init", "-b", "main")
+        result = self.run_maintenance(True)
+        self.assertIn("nested", self.target_result(result)["reason"])
+        self.assertTrue(self.linked.exists())
+
     def test_age_policy_matches_either_threshold_and_rejects_unknown_times(self):
         self.config.created_before = 30 * 86400
         self.config.inactive = 7 * 86400
@@ -277,8 +339,10 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIn("cwd", self.target_result(result)["reason"])
         rows = M.scan(self.config)
         next(row for row in rows if row["path"] == str(self.linked))["dirty"] = None
-        result = M.reclaim_worktrees(self.config, rows, self.now, True)
-        self.assertIn("unknown", next(row for row in result if row["path"] == str(self.linked))["reason"])
+        for discard in (False, True):
+            self.config.discard_stale = discard
+            result = M.reclaim_worktrees(self.config, rows, self.now, True)
+            self.assertIn("unknown", next(row for row in result if row["path"] == str(self.linked))["reason"])
         self.assertTrue(self.linked.exists())
 
     def test_configuration_defaults_validation_and_optional_thresholds(self):
@@ -290,15 +354,19 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(legacy.created_before, 7 * 86400)
         self.assertIsNone(legacy.inactive)
         self.assertTrue(legacy.reclaim_cache)
-        data.update(created_before=None, inactive="14d", reclaim_cache=False)
+        self.assertFalse(legacy.discard_stale)
+        data.update(created_before=None, inactive="14d", reclaim_cache=False, discard_stale=True)
         path.write_text(json.dumps(data))
         current = M.Config.read(path)
         self.assertIsNone(current.created_before)
         self.assertEqual(current.inactive, 14 * 86400)
         self.assertFalse(current.reclaim_cache)
+        self.assertTrue(current.discard_stale)
         for field, value in (("inactive", None), ("inactive", "0d"), ("inactive", "-1d"),
                              ("inactive", "9999999999999w"), ("inactive", True),
-                             ("inactive", 7), ("reclaim_cache", "false"), ("extra", "unknown")):
+                             ("inactive", 7), ("reclaim_cache", "false"),
+                             ("discard_stale", "true"), ("discard_stale", 1),
+                             ("discard_stale", None), ("extra", "unknown")):
             with self.subTest(field=field, value=value):
                 path.write_text(json.dumps(dict(data, **{field: value})))
                 with self.assertRaises(M.Unsafe):
@@ -309,7 +377,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(M.duration("6h"), 21600)
         self.assertEqual(M.duration("2147483647s"), M.MAX_DURATION)
 
-    def test_expected_head_refuses_changed_commit_and_invalid_options(self):
+    def test_expected_head_refuses_changed_commit_and_multiple_targets(self):
         rows = json.loads(self.original_command([str(BINARY), "--json", str(self.root)]).stdout)["worktrees"]
         row = next(row for row in rows if row["path"] == str(self.linked))
         self.git(self.linked, "commit", "--allow-empty", "-m", "unpublished")
@@ -320,6 +388,73 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIn(b"changed", result.stdout)
         for extra in (["--force"], ["--id", row["id"]]):
             self.assertNotEqual(self.original_command(args + extra, check=False).returncode, 0)
+
+    def test_expected_force_protects_main_locked_and_renamed_worktrees(self):
+        rows = json.loads(self.original_command([str(BINARY), "--json", str(self.root)]).stdout)["worktrees"]
+        row = next(row for row in rows if row["path"] == str(self.linked))
+        main = next(row for row in rows if row["main"])
+        self.git(self.repo, "worktree", "lock", str(self.linked))
+        for target, reason in ((row, b"locked"), (main, b"main checkout")):
+            for mode in ("--dry-run", "--yes"):
+                with self.subTest(target=target["branch"], mode=mode):
+                    args = [str(BINARY), "delete", "--id", target["id"], "--expected-head", target["head"],
+                            "--force", mode, "--json", str(self.root)]
+                    result = self.original_command(args, check=False)
+                    item = json.loads(result.stdout)["items"][0]
+                    self.assertNotEqual(item["result"], "ok", item)
+                    self.assertIn(reason, result.stdout)
+                    self.assertTrue(self.linked.exists())
+                    self.assertTrue(self.repo.exists())
+        self.git(self.repo, "worktree", "unlock", str(self.linked))
+        self.git(self.linked, "branch", "-m", "renamed")
+        args = [str(BINARY), "delete", "--id", row["id"], "--expected-head", row["head"],
+                "--force", "--yes", "--json", str(self.root)]
+        result = self.original_command(args, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(self.linked.exists())
+
+    def test_expected_force_preserves_registered_nested_worktree(self):
+        nested = self.linked / "node_modules/worker"
+        nested.parent.mkdir()
+        self.git(self.repo, "worktree", "add", "-b", "worker", str(nested))
+        self.git(self.repo, "worktree", "lock", str(nested))
+        self.config.discard_stale = True
+        result = self.run_maintenance(True)
+        self.assertIn("registered nested", self.target_result(result)["reason"])
+        rows = json.loads(self.original_command([str(BINARY), "--json", str(self.root)]).stdout)["worktrees"]
+        row = next(row for row in rows if row["path"] == str(self.linked))
+        for mode in ("--dry-run", "--yes"):
+            args = [str(BINARY), "delete", "--id", row["id"], "--expected-head", row["head"],
+                    "--force", mode, "--json", str(self.root)]
+            result = self.original_command(args, check=False)
+            self.assertIn(b"registered nested", result.stdout)
+            self.assertTrue(nested.exists())
+            self.assertTrue(self.linked.exists())
+
+    def test_expected_force_refuses_a_lock_created_during_removal(self):
+        rows = json.loads(self.original_command([str(BINARY), "--json", str(self.root)]).stdout)["worktrees"]
+        row = next(row for row in rows if row["path"] == str(self.linked))
+        commands = self.base / "locking-commands"
+        commands.mkdir()
+        real_git = shutil.which("git")
+        recorded = self.base / "remove-args.json"
+        wrapper = commands / "git"
+        wrapper.write_text(
+            "#!" + sys.executable + "\nimport json,os,subprocess,sys\nfrom pathlib import Path\n"
+            "args=sys.argv[1:]\n"
+            "if 'worktree' in args and args[args.index('worktree'):][:2] == ['worktree','remove']:\n"
+            "    Path(" + repr(str(recorded)) + ").write_text(json.dumps(args))\n"
+            "    subprocess.run(" + repr([real_git, "-C", str(self.repo), "worktree", "lock", str(self.linked)]) + ",check=True)\n"
+            "os.execv(" + repr(real_git) + ",[" + repr(real_git) + ",*args])\n")
+        wrapper.chmod(0o700)
+        args = [str(BINARY), "delete", "--id", row["id"], "--expected-head", row["head"],
+                "--force", "--yes", "--json", str(self.root)]
+        with patch.dict(os.environ, {"PATH": str(commands) + os.pathsep + os.environ["PATH"]}):
+            result = self.original_command(args, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"locked", result.stdout)
+        self.assertEqual(json.loads(recorded.read_text()).count("--force"), 1)
+        self.assertTrue(self.linked.exists())
 
     def test_untracked_and_unpushed_content_are_preserved(self):
         (self.linked / "untracked.txt").write_text("keep\n")
@@ -405,6 +540,14 @@ class MaintenanceTests(unittest.TestCase):
         result = self.run_maintenance(True)
         self.assertIn("uncommitted", self.target_result(result)["reason"])
         self.assertTrue(self.linked.exists())
+        self.config.discard_stale = True
+        result = self.run_maintenance(True)
+        self.assertIn("nested", self.target_result(result)["reason"])
+        self.git(self.linked, "-c", "protocol.file.allow=always", "submodule", "deinit", "--force", "dependency")
+        for apply in (False, True):
+            result = self.run_maintenance(apply)
+            self.assertIn("submodules", self.target_result(result)["reason"])
+            self.assertTrue(self.linked.exists())
 
     def test_nested_checkout_and_planning_are_preserved(self):
         nested = self.linked / "node_modules/nested"
@@ -508,15 +651,19 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(policy["created_before"], "30d")
         self.assertEqual(policy["inactive"], "7d")
         self.assertFalse(policy["reclaim_cache"])
+        self.assertFalse(policy["discard_stale"])
+        self.assertFalse(installed["discard_stale"])
         native_entry = [str(install / "wtrm"), "maintain", "--config", str(install / "config.json")]
         self.assertEqual(installed["dry_run"], native_entry)
         self.assertEqual(agent["ProgramArguments"], native_entry + ["--yes"])
-        result = subprocess.run(args + ["--include-cache", "--created-before", "none"],
+        result = subprocess.run(args + ["--include-cache", "--discard-stale", "--created-before", "none"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         policy = json.loads((install / "config.json").read_text())
         self.assertIsNone(policy["created_before"])
         self.assertTrue(policy["reclaim_cache"])
+        self.assertTrue(policy["discard_stale"])
+        self.assertTrue(json.loads(result.stdout)["discard_stale"])
 
     def test_installer_rejects_old_binary_before_writing_files(self):
         home = self.base / "old-binary-home"
