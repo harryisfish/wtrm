@@ -58,13 +58,15 @@ def optional_duration(raw):
     return raw
 
 
-def command(args, check=True):
+def command(args, check=True, timeout=60):
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_PAGER="cat")
     try:
         result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
-                                env=env, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise Unsafe("command unavailable or timed out: " + str(args[0])) from error
+                                env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise Unsafe(f"command timed out after {timeout}s: " + " ".join(map(str, args))) from error
+    except OSError as error:
+        raise Unsafe("command unavailable: " + str(args[0])) from error
     if check and result.returncode:
         raise Unsafe("command failed: " + str(args[0]))
     return result
@@ -274,7 +276,7 @@ def session_reason(path, sessions):
 
 
 def scan(config):
-    result = json.loads(command([str(config.wtrm), "--json", str(config.root)]).stdout)
+    result = json.loads(command([str(config.wtrm), "--json", str(config.root)], timeout=300).stdout)
     if (not isinstance(result, dict) or result.get("schema_version") != 1
             or result.get("complete") is not True or result.get("errors")
             or not isinstance(result.get("worktrees"), list)
@@ -420,7 +422,7 @@ def reclaim_worktrees(config, worktrees, now, apply):
             activity.fresh()
             args = [str(config.wtrm), "delete", "--id", row["id"], "--expected-head", head,
                     "--branches", "keep", "--json", "--yes" if apply else "--dry-run", str(config.root)]
-            result = json.loads(command(args).stdout)
+            result = json.loads(command(args, timeout=600).stdout)
             items = result.get("items", [])
             expected = "ok" if apply else "dry-run"
             if (result.get("errors") or len(items) != 1 or items[0].get("result") != expected
