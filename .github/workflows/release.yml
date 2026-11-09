@@ -47,7 +47,8 @@ jobs:
           mkdir -p "dist/${stage}"
           cp "target/${target}/release/wtrm${ext}" "dist/${stage}/wtrm${ext}"
           if [[ "$target" == *windows* ]]; then
-            tar -a -cf "dist/${stage}.zip" -C dist "${stage}"
+            python -m zipfile -c "dist/${stage}.zip" "dist/${stage}"
+            python -m zipfile -t "dist/${stage}.zip"
           else
             tar -czf "dist/${stage}.tar.gz" -C dist "${stage}"
           fi
