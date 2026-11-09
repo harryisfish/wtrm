@@ -70,7 +70,7 @@ class MaintenanceTests(unittest.TestCase):
                                "-c", "user.email=fixture@example.invalid", *args],
                               check=True, capture_output=True).stdout.decode().strip()
 
-    def fake_command(self, args, check=True):
+    def fake_command(self, args, check=True, timeout=60):
         if args[0] == "diskutil":
             fields = {"VolumeUUID": self.uuid, "Writable": self.writable, "Internal": False}
             if self.mount_point is not None:
@@ -91,7 +91,7 @@ class MaintenanceTests(unittest.TestCase):
                    "headRefOid": self.git(self.linked, "rev-parse", "HEAD"), "headRefName": "topic",
                    "headRepository": {"name": "demo"}, "headRepositoryOwner": {"login": "test-owner"}}
             return subprocess.CompletedProcess(args, 0, json.dumps([row]).encode(), b"")
-        return self.original_command(args, check)
+        return self.original_command(args, check=check, timeout=timeout)
 
     def run_maintenance(self, apply=False):
         return M.run(self.config, apply=apply, now=self.now)
@@ -122,6 +122,53 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "complete", result)
         self.assertEqual(self.target_result(result)["action"], "would_remove", result)
         self.assertTrue(self.linked.exists())
+
+    def test_scan_timeout_stops_maintenance_before_reclamation(self):
+        scan_args = [str(self.config.wtrm), "--json", str(self.root)]
+
+        def delayed_scan(args, **kwargs):
+            self.assertEqual(args, scan_args)
+            if kwargs["timeout"] < 301:
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"], output=b"partial scan")
+            self.fail("scan exceeded its deadline")
+
+        with patch.object(M.subprocess, "run", side_effect=delayed_scan), \
+                patch.object(M, "reclaim_worktrees") as reclaim, \
+                patch.object(M, "repository_caches") as caches:
+            result = self.run_maintenance(True)
+        self.assertEqual(result["status"], "error", result)
+        self.assertEqual(result["errors"], ["command timed out after 300s: " + " ".join(scan_args)])
+        self.assertEqual(result["worktrees"], [])
+        self.assertEqual(result["caches"], [])
+        reclaim.assert_not_called()
+        caches.assert_not_called()
+        self.assertTrue(self.linked.exists())
+        self.assertEqual((self.linked / "source.txt").read_text(), "source\n")
+
+    def test_other_commands_keep_the_default_deadline(self):
+        args = ["git", "-C", str(self.repo), "status"]
+
+        def delayed_command(args, **kwargs):
+            if kwargs["timeout"] < 61:
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            self.fail("ordinary command exceeded its deadline")
+
+        with patch.object(M.subprocess, "run", side_effect=delayed_command):
+            with self.assertRaises(M.Unsafe) as raised:
+                self.original_command(args, check=False)
+        self.assertEqual(str(raised.exception), "command timed out after 60s: " + " ".join(args))
+
+    def test_short_subprocess_deadline_and_unavailable_command_are_distinct(self):
+        args = [sys.executable, "-c", "import time; time.sleep(1)"]
+        with self.assertRaises(M.Unsafe) as raised:
+            self.original_command(args, timeout=0.01)
+        self.assertEqual(str(raised.exception), "command timed out after 0.01s: " + " ".join(args))
+        self.assertIsInstance(raised.exception.__cause__, subprocess.TimeoutExpired)
+        with patch.object(M.subprocess, "run", side_effect=FileNotFoundError("missing")):
+            with self.assertRaises(M.Unsafe) as raised:
+                self.original_command(["missing-command"])
+        self.assertEqual(str(raised.exception), "command unavailable: missing-command")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
 
     def test_dry_run_and_delete_keep_source_branch(self):
         result = self.run_maintenance()
