@@ -145,6 +145,50 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(self.linked.exists())
         self.assertEqual((self.linked / "source.txt").read_text(), "source\n")
 
+    def test_delete_rescan_can_complete_after_the_scan_deadline(self):
+        original_run = subprocess.run
+        for elapsed in (61, 301):
+            with self.subTest(elapsed=elapsed):
+                delete_calls = []
+
+                def delayed_delete(args, **kwargs):
+                    if args[:2] == [str(self.config.wtrm), "delete"]:
+                        delete_calls.append(args)
+                        if kwargs["timeout"] < elapsed:
+                            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+                    return original_run(args, **kwargs)
+
+                with patch.object(M.subprocess, "run", side_effect=delayed_delete):
+                    result = self.run_maintenance()
+                self.assertEqual(result["status"], "complete", result)
+                self.assertEqual(self.target_result(result)["action"], "would_remove", result)
+                self.assertEqual(len(delete_calls), 1)
+                self.assertIn("--dry-run", delete_calls[0])
+                self.assertTrue(self.linked.exists())
+
+    def test_delete_timeout_keeps_the_worktree_and_reports_the_error(self):
+        original_run = subprocess.run
+        delete_calls = []
+
+        def delayed_delete(args, **kwargs):
+            if args[:2] == [str(self.config.wtrm), "delete"]:
+                delete_calls.append(args)
+                self.assertIn("--yes", args)
+                if kwargs["timeout"] < 601:
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"], output=b"partial delete")
+                self.fail("delete exceeded its deadline")
+            return original_run(args, **kwargs)
+
+        with patch.object(M.subprocess, "run", side_effect=delayed_delete):
+            result = self.run_maintenance(True)
+        item = self.target_result(result)
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual(item["action"], "skip", result)
+        self.assertEqual(item["reason"], "command timed out after 600s: " + " ".join(delete_calls[0]))
+        self.assertFalse(any(row["action"] == "removed" for row in result["worktrees"]))
+        self.assertTrue(self.linked.exists())
+        self.assertEqual((self.linked / "source.txt").read_text(), "source\n")
+
     def test_other_commands_keep_the_default_deadline(self):
         args = ["git", "-C", str(self.repo), "status"]
 
