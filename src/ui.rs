@@ -880,7 +880,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let lines = if app.filter_mode {
         vec![
             Line::from("Enter apply · Esc clear text"),
-            Line::from("Text and preset filters both apply. 0 clears both."),
+            Line::from("Text and preset filters both apply."),
             Line::from(app.status_text()),
         ]
     } else if app.scanning() && app.items.is_empty() {
@@ -1273,9 +1273,9 @@ fn help_lines() -> Vec<Line<'static>> {
         "",
         "Filters",
         "/ edits the text filter · Enter applies · Esc clears text",
-        "m merged · i inactive · s old and inactive · 0 clears all filters",
+        "In browse: m merged · i inactive · s old and inactive · 0 clears all filters",
         "Presets replace the text filter. Filters never change selections.",
-        "Merged means the commit is in the local default branch. Squash merges are not detected.",
+        "Merged uses the default branch, preferring local and falling back to its remote-tracking ref. No network lookup. Squash merges are not detected.",
         "",
         "Review and confirm",
         "j/k, PgUp/PgDn and Home/End scroll all targets, details and results.",
