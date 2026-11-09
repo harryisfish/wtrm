@@ -1,0 +1,15 @@
+base_branch = "main"
+
+[[scope]]
+prefix = ""
+name = "wtrm"
+check = 'mkdir -p .artifacts/tmp && TMPDIR="$PWD/.artifacts/tmp" CARGO_TARGET_DIR=.artifacts/target cargo test --locked'
+build = "CARGO_TARGET_DIR=.artifacts/target cargo build --locked --release"
+
+[[domain_check]]
+name = "reclamation-safety"
+trigger_paths = ["scripts/**", "src/**"]
+command = "WTRM_TEST_BINARY=.artifacts/target/release/wtrm python3 scripts/test-reclaim-space.py"
+
+[report]
+language = "zh"

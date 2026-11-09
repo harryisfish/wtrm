@@ -800,6 +800,7 @@ fn run_delete(
             true,
             force,
             branches,
+            None,
         ));
     }
     app.apply_mutate_result(all);
@@ -857,9 +858,23 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         format!("filter: {} | text: {:?}", app.query.label(), app.filter)
     };
+    let header = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(chunks[0]);
+    frame.render_widget(Paragraph::new(selection_text(app)), header[0]);
+    let filter = Line::from(filter);
+    let mut scroll = 0;
+    if app.filter_mode {
+        let hidden = filter.width().saturating_sub(header[1].width as usize);
+        // Round past a clipped wide grapheme so the caret stays visible.
+        for grapheme in filter.styled_graphemes(Style::new()) {
+            if scroll >= hidden {
+                break;
+            }
+            scroll += Line::from(grapheme.symbol).width();
+        }
+    }
     frame.render_widget(
-        Paragraph::new(vec![Line::from(selection_text(app)), Line::from(filter)]),
-        chunks[0],
+        Paragraph::new(filter).scroll((0, scroll.min(u16::MAX as usize) as u16)),
+        header[1],
     );
     draw_table(frame, app, chunks[1]);
     let lines = if app.filter_mode {
@@ -874,7 +889,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         vec![
             Line::from("j/k move · space select · a visible · v selected · c clear"),
             Line::from("d delete · x clean deps · Enter details · R results · ? help"),
-            Line::from("m merged · i idle · s old+idle · 0 clear · / filter · q quit"),
+            Line::from("m/i/s presets · 0 clear · / filter · r refresh · q quit"),
             Line::from(app.status_text()),
         ]
     };
@@ -889,7 +904,7 @@ struct ColumnSpec {
 }
 
 fn column_spec(width: u16) -> ColumnSpec {
-    if width >= 110 {
+    if width >= 120 {
         ColumnSpec {
             headers: vec![
                 "", "id", "active", "repo", "branch", "folder", "status", "path",
@@ -913,10 +928,10 @@ fn column_spec(width: u16) -> ColumnSpec {
             widths: vec![
                 Constraint::Length(2),
                 Constraint::Length(8),
-                Constraint::Length(14),
-                Constraint::Length(16),
+                Constraint::Length(if width < 80 { 8 } else { 14 }),
+                Constraint::Length(if width < 80 { 10 } else { 16 }),
                 Constraint::Length(6),
-                Constraint::Min(18),
+                Constraint::Min(16),
             ],
             show_folder: false,
             show_path: false,
@@ -1424,7 +1439,19 @@ mod tests {
             .buffer()
             .content
             .chunks(width as usize)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .map(|row| {
+                let mut line = String::new();
+                let mut skip = 0;
+                for cell in row {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    line.push_str(cell.symbol());
+                    skip = Line::from(cell.symbol()).width().saturating_sub(1);
+                }
+                line
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1459,6 +1486,99 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn browsing_keeps_shortcuts_visible_with_long_details() {
+        for (width, height) in [(120, 30), (80, 24), (60, 18)] {
+            let mut app = app_with(long_worktrees());
+            app.items[0].dirty = Some(true);
+            app.items[0].locked = true;
+            let screen = render(&mut app, width, height);
+            for hint in [
+                "j/k move",
+                "space select",
+                "a visible",
+                "v selected",
+                "c clear",
+                "d delete",
+                "x clean deps",
+                "Enter details",
+                "R results",
+                "? help",
+                "m/i/s presets",
+                "0 clear",
+                "/ filter",
+                "r refresh",
+                "q quit",
+            ] {
+                assert!(
+                    screen.contains(hint),
+                    "{width}x{height} missing {hint}:\n{screen}"
+                );
+            }
+            assert!(screen.contains("[dirty] [locked]"), "{screen}");
+            assert!(screen.contains("scanned ~/project"), "{screen}");
+            let header = screen.lines().nth(3).unwrap();
+            assert_eq!(header.contains("folder"), width >= 120, "{screen}");
+            assert_eq!(header.contains("path"), width >= 120, "{screen}");
+        }
+    }
+
+    #[test]
+    fn empty_and_filter_states_keep_recovery_keys_and_caret_visible() {
+        for (width, height) in [(120, 30), (80, 24), (60, 18), (61, 18)] {
+            let mut app = app_with(Vec::new());
+            let screen = render(&mut app, width, height);
+            assert!(
+                screen.contains("No repos with linked worktrees."),
+                "{screen}"
+            );
+            assert!(screen.contains("r refresh"), "{screen}");
+            assert_eq!(
+                app.on_key(KeyCode::Char('r'), KeyModifiers::NONE),
+                Action::Rescan
+            );
+
+            app.op = OperationStatus::Running {
+                action: ActionKind::Scan,
+                total: 0,
+            };
+            app.note = "scanning ~/project …".to_string();
+            let screen = render(&mut app, width, height);
+            assert!(screen.contains("scanning ~/project"), "{screen}");
+            assert!(screen.contains("q quit"), "{screen}");
+            assert!(
+                !screen.contains("No repos with linked worktrees."),
+                "{screen}"
+            );
+
+            let mut app = app_with(long_worktrees());
+            app.filter = "no-such-worktree".to_string();
+            app.clamp_cursor();
+            let screen = render(&mut app, width, height);
+            assert!(screen.contains("No matches."), "{screen}");
+            assert!(
+                !screen.contains("No repos with linked worktrees."),
+                "{screen}"
+            );
+            assert!(screen.contains("/ filter"), "{screen}");
+            assert!(screen.contains("0 clear"), "{screen}");
+            assert!(screen.contains("text: \"no-such-worktree\""), "{screen}");
+
+            app.on_key(KeyCode::Char('0'), KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+            app.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+            app.filter = format!("{}终点é-tail", "长过滤/".repeat(64));
+            let screen = render(&mut app, width, height);
+            assert!(
+                screen.lines().nth(1).unwrap().contains("终点é-tail_"),
+                "{screen}"
+            );
+            assert!(screen.contains("selected: 8"), "{screen}");
+            assert!(!screen.contains('\u{fffd}'), "{screen}");
+            assert!(screen.contains("Enter apply · Esc clear text"), "{screen}");
+        }
     }
 
     #[test]
@@ -1666,7 +1786,10 @@ mod tests {
         assert!(!narrow.show_path);
         assert!(narrow.headers.contains(&"status"));
         assert!(narrow.headers.contains(&"repo"));
-        let wide = column_spec(140);
+        assert!(!column_spec(119).show_path);
+        assert_eq!(column_spec(60).widths[2], Constraint::Length(8));
+        assert_eq!(column_spec(60).widths[3], Constraint::Length(10));
+        let wide = column_spec(120);
         assert!(wide.show_folder);
         assert!(wide.show_path);
     }

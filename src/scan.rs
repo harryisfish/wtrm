@@ -288,6 +288,9 @@ pub fn scan(roots: &[PathBuf], max_depth: u8) -> ScanResult {
     let mut errors = Vec::new();
     let mut commons = BTreeSet::new();
     for root in roots {
+        if excluded_path(root) {
+            continue;
+        }
         if !root.exists() {
             errors.push(format!("missing: {}", root.display()));
             continue;
@@ -324,13 +327,18 @@ fn discover(root: &Path, max_depth: u8, out: &mut BTreeSet<PathBuf>) {
     let mut stack = vec![(root.to_path_buf(), 0u8)];
     let mut seen = HashSet::new();
     while let Some((dir, depth)) = stack.pop() {
+        if excluded_path(&dir) {
+            continue;
+        }
         if !seen.insert(dir.clone()) {
             continue;
         }
         let git = dir.join(".git");
         if git.exists() {
             if let Some(common) = common_git_dir(&git) {
-                out.insert(common);
+                if !excluded_path(&common) {
+                    out.insert(common);
+                }
             }
             continue;
         }
@@ -342,6 +350,11 @@ fn discover(root: &Path, max_depth: u8, out: &mut BTreeSet<PathBuf>) {
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.to_ascii_lowercase().contains("trash") {
+                continue;
+            }
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(_) => continue,
@@ -349,8 +362,6 @@ fn discover(root: &Path, max_depth: u8, out: &mut BTreeSet<PathBuf>) {
             if !ft.is_dir() {
                 continue;
             }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
             if SKIP_DIRS.iter().any(|skip| *skip == name.as_ref()) {
                 continue;
             }
@@ -360,6 +371,9 @@ fn discover(root: &Path, max_depth: u8, out: &mut BTreeSet<PathBuf>) {
 }
 
 fn inspect(common: &Path) -> Result<Vec<Job>, String> {
+    if excluded_path(common) {
+        return Ok(Vec::new());
+    }
     let git_dir = common.to_string_lossy().into_owned();
     let text = git_output(&["--git-dir", &git_dir, "worktree", "list", "--porcelain"])?;
     let records = parse_porcelain(&text);
@@ -380,6 +394,9 @@ fn inspect(common: &Path) -> Result<Vec<Job>, String> {
         .clone()
         .or_else(|| common.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| common.to_path_buf());
+    if excluded_path(&repo_root) {
+        return Ok(Vec::new());
+    }
     let repo = repo_root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -388,6 +405,7 @@ fn inspect(common: &Path) -> Result<Vec<Job>, String> {
     let base = default_base(&repo_root);
     Ok(records
         .into_iter()
+        .filter(|raw| !excluded_path(&raw.path))
         .map(|raw| {
             let main = !raw.bare && main_path.as_ref() == Some(&raw.path);
             Job {
@@ -400,6 +418,12 @@ fn inspect(common: &Path) -> Result<Vec<Job>, String> {
             }
         })
         .collect())
+}
+
+fn excluded_path(path: &Path) -> bool {
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("trash")
 }
 
 fn enrich(job: Job) -> Worktree {
@@ -709,6 +733,15 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn excludes_named_paths_before_filesystem_access() {
+        let root = PathBuf::from("/does-not-exist/old-TrAsH/repository");
+        let result = scan(std::slice::from_ref(&root), 8);
+        assert!(result.worktrees.is_empty());
+        assert!(result.errors.is_empty());
+        assert!(inspect(&root).unwrap().is_empty());
+    }
+
+    #[test]
     fn stable_id_is_deterministic_and_unique() {
         let a = stable_id("demo", "feature", Path::new("/repos/demo/.worktrees/feat"));
         let b = stable_id("demo", "feature", Path::new("/repos/demo/.worktrees/feat"));
@@ -909,9 +942,9 @@ prunable gitdir file points to non-existent location
         let again = load(std::slice::from_ref(&root), 4, &Query::default());
         let dirty = again.worktrees.iter().find(|wt| wt.deletable()).unwrap();
         assert_eq!(dirty.dirty, Some(true));
-        let refused = crate::remove::delete_one(dirty, false).unwrap_err();
+        let refused = crate::remove::delete_one(dirty, false, None).unwrap_err();
         assert!(refused.contains("clean"), "{refused}");
-        crate::remove::delete_one(dirty, true).unwrap();
+        crate::remove::delete_one(dirty, true, None).unwrap();
         assert!(!linked.exists());
     }
 
