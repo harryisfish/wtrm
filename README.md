@@ -91,7 +91,7 @@ JSON 顶层固定为：
 | `a` | 切换当前可见列表里全部可删除项（不是无条件全选） |
 | `d` | 确认删除 worktree |
 | `x` | 只清理选中 worktree 里的依赖目录 |
-| `y` 或输入 `delete` | 删除干净的 worktree；清理依赖时确认。底部显示每条 `ok`/`blocked`/`failed` |
+| `y` 或输入 `delete` | 确认删除干净的 worktree；清理依赖仅用 `y` 确认。底部显示 `ok`/`blocked`/`failed` 摘要 |
 | `f` | 强制删除，包括脏和锁定的 |
 | `b` | 确认删除时切换分支策略：保留、只删本地、或连 GitHub 远程一起删 |
 | `/` | 按文字过滤；Enter 应用，Esc 清空 |
