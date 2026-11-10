@@ -88,8 +88,6 @@ JSON 顶层固定为：
 
 ## 后台定期清理 macOS 外置盘
 
-按时间丢弃模式不应把父目录的历史会话记录视为所有子工作树正在使用的证据。
-
 时间命中并不代表本地内容已保存。允许丢弃未提交修改和未跟踪文件的策略必须显式配置，执行前应先检查 dry-run 报告。
 
 `wtrm maintain --config <path>` 每次扫描并生成一份报告，默认 dry-run。显式 `--yes` 才删除，`--apply` 仍可使用。macOS LaunchAgent 定期调用此入口，不需要保持终端打开。
@@ -98,11 +96,11 @@ JSON 顶层固定为：
 
 创建年龄和空闲年龄按「或者」匹配。例如 `--created-before 30d --inactive 7d` 允许创建满 30 天或最近 7 天未活跃的工作树进入安全检查。只要一个条件满足即可，创建很久但刚活跃的工作树也可能匹配。单个条件用 `none` 禁用，两个条件不能同时禁用。默认只启用创建满 7 天，间隔为 `1h`。时长接受正整数和 `s`、`m`、`h`、`d`、`w`，不带单位时为秒，拒绝零、负数和溢出值。手动查询的多个条件仍是「并且」。
 
-空闲年龄沿用扫描的近似活跃时间，即提交、git index 和 worktree 根目录的最新修改时间，不能准确反映所有文件阅读或嵌套文件活动。未知、无效或未来的时间不会命中对应条件。默认保守策略还要求 GitHub PR 已合并且 HEAD 完全相同，并重新检查未提交内容和未推送提交。两种策略都检查打开文件和 Codex 会话。主检出、锁定、缺失、嵌套、含 `planning` 或 `.planning`、状态未知，以及包含当前进程目录、维护程序、配置或报告的工作树会保留。Pinned 会话始终保护相关目录，最近 7 天的未归档会话也保护相关目录。无关目录的会话不锁住整盘；会话后来跨目录访问的行为无法只凭 cwd 推断，程序同时检查当时打开的文件。
+空闲年龄沿用扫描的近似活跃时间，即提交、git index 和 worktree 根目录的最新修改时间，不能准确反映所有文件阅读或嵌套文件活动。未知、无效或未来的时间不会命中对应条件。默认保守策略还要求 GitHub PR 已合并且 HEAD 完全相同，并重新检查未提交内容和未推送提交。两种策略都检查实时进程 cwd 和打开文件。主检出、锁定、缺失、嵌套、含 `planning` 或 `.planning`、状态未知，以及包含当前进程目录、维护程序、配置或报告的工作树会保留。默认保守策略还检查 Codex 会话元数据，pinned 会话和最近 7 天的未归档会话会保护相关目录。无关目录的会话不锁住整盘。会话后来跨目录访问的行为无法只凭 cwd 推断，程序同时检查当时打开的文件。
 
 默认保守策略也检查 Git 忽略的内容，只放行 `node_modules`、`target`、`.next`、`.turbo`、`.venv`、`venv`、`__pycache__`、`Pods`、`.gradle`、`DerivedData`、`build`、`dist`、`.artifacts` 这些可重建目录和 `.DS_Store`。其他 ignored 文件或目录，例如 `.env.local`、`.cursor` 配置和本地数据，会阻止回收并记入报告。此保护不改变手动 `wtrm delete` 的行为。
 
-安装时显式加 `--discard-stale`，或在配置中设置 `"discard_stale": true`，允许丢弃年龄命中的工作树。此策略删除未提交修改、未跟踪文件和 ignored 本地内容，不要求 PR 已合并或提交已推送，也不调用 GitHub。文件不会备份，所有分支仍保留。它仍拒绝子模块，并保留上述活动、锁定、嵌套、planning 和卷身份保护。创建年龄与空闲年龄仍按「或者」匹配，创建阈值可命中刚编辑过的工作树。只按空闲年龄丢弃时使用 `--created-before none --inactive 14d --discard-stale`。
+安装时显式加 `--discard-stale`，或在配置中设置 `"discard_stale": true`，允许丢弃年龄命中的工作树。此策略删除未提交修改、未跟踪文件和 ignored 本地内容，不要求 PR 已合并或提交已推送，也不调用 GitHub。它不读取 Codex 会话数据库，祖先目录或当前工作树的会话记录，包括 pinned 和最近 7 天的未归档记录，都不会阻止回收。文件不会备份，所有分支仍保留。它仍拒绝子模块，并保留实时占用、锁定、嵌套、planning 和卷身份保护。创建年龄与空闲年龄仍按「或者」匹配，创建阈值可命中刚编辑过的工作树。只按空闲年龄丢弃时使用 `--created-before none --inactive 14d --discard-stale`。
 
 新安装默认只回收工作树，保留所有分支，不运行 `clean` 或 `--force`。只有 `discard_stale` 策略使用带 `--expected-head` 的强制删除。加 `--include-cache` 才同时回收旧 Turbo 缓存。缓存按仓库合计主检出和附加工作树的 `.turbo/cache`，软上限是 5 GiB。超过上限时，按修改时间淘汰超过 24 小时、未被打开的完整 hash 组，包括归档、meta 和 manifest。近期或被占用的组可以让缓存暂时超过上限，报告会显示剩余超限量。未知文件保留。
 
@@ -137,7 +135,7 @@ python3 scripts/install-reclaim-space.py \
 }
 ```
 
-直接修改 JSON 策略会在下一轮生效，`null` 禁用对应年龄条件。`discard_stale` 必须为布尔值，省略时为 `false`。安装器输出的 `discard_stale` 和报告的 `worktree_policy.discard_stale` 标明所选策略。`maintain` 从配置文件读取根目录和阈值，拒绝命令行扫描根、筛选参数和非默认扫描深度；上述年龄参数传给安装器。原有六字段配置继续按创建满 7 天、开启缓存回收和保守策略运行。运行间隔保存在 plist 的 `StartInterval` 秒数中。修改间隔时先停用任务，再用新参数重新运行安装器并加载。
+直接修改 JSON 策略会在下一轮生效，`null` 禁用对应年龄条件。`discard_stale` 必须为布尔值，省略时为 `false`。`codex_db` 字段仍需保留，但 `discard_stale` 模式不要求该路径存在。安装器输出的 `discard_stale` 和报告的 `worktree_policy.discard_stale` 标明所选策略。`maintain` 从配置文件读取根目录和阈值，拒绝命令行扫描根、筛选参数和非默认扫描深度；上述年龄参数传给安装器。原有六字段配置继续按创建满 7 天、开启缓存回收和保守策略运行。运行间隔保存在 plist 的 `StartInterval` 秒数中。修改间隔时先停用任务，再用新参数重新运行安装器并加载。
 
 先运行安装器输出的 dry-run 命令，检查报告后再启用：
 
@@ -146,7 +144,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.wtrm.maintena
 launchctl kickstart "gui/$(id -u)/com.wtrm.maintenance"
 ```
 
-定时任务以私有 `wtrm maintain --config <path> --yes` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。维护需要 `git`、`diskutil`、`lsof` 和可读的 Codex 会话数据库。默认保守策略还需要已认证的 `gh`，`discard_stale` 策略不需要 `gh`。外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。此维护入口只支持 macOS，不影响其他平台的手动扫描和删除。
+定时任务以私有 `wtrm maintain --config <path> --yes` 为主进程。`maintain` 只启动自身目录中的普通文件 `reclaim-space.py`，拒绝符号链接和其他用户可写的目录或脚本。它固定使用 `/usr/bin/python3 -I` 隔离模式，等待子进程完成并传递退出状态。维护需要 `git`、`diskutil` 和 `lsof`。默认保守策略还需要可读的 Codex 会话数据库和已认证的 `gh`，`discard_stale` 策略不需要这两项。外置盘权限仍由 macOS 系统设置控制，安装器不修改权限。此维护入口只支持 macOS，不影响其他平台的手动扫描和删除。
 
 任务按配置间隔运行，每轮重新扫描，使用同一安装目录的单实例锁，仅保留最近 20 份报告。launchd 不会并发启动同一任务，错过的周期不会堆积。不要用多个安装目录同时清理同一个扫描根，它们不共享锁。外置盘身份不匹配或活动探测失败时保留数据。默认保守策略在 GitHub 状态无法确认时也保留数据。文件和进程检查不能原子锁住随后启动的其他程序，程序会在删除前复核身份；不要把它当作并发写入锁。
 

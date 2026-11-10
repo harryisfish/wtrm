@@ -72,7 +72,8 @@ def main():
     if "--yes" not in maintain_help:
         raise MAINTENANCE.Unsafe("wtrm binary lacks maintain --yes")
     config.validate_volume()
-    MAINTENANCE.safe_path(args.codex_db)
+    if not config.discard_stale:
+        MAINTENANCE.safe_path(args.codex_db)
     install = MAINTENANCE.prepare_directory(args.install_dir)
     MAINTENANCE.prepare_directory(args.report_dir)
     installed_binary = install / "wtrm"

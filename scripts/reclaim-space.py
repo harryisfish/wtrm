@@ -247,6 +247,8 @@ class Activity:
 
 
 def session_paths(config, now):
+    if config.discard_stale:
+        return []
     database = safe_path(config.codex_db)
     try:
         with contextlib.closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=2)) as connection:
@@ -619,7 +621,9 @@ def run(config, apply=False, now=None):
                                   "inactive_seconds": config.inactive, "match": "any",
                                   "discard_stale": config.discard_stale},
               "reclaim_cache": config.reclaim_cache,
-              "activity_scope": "canonical session cwd and open files; later cross-cwd use cannot be inferred"}
+              "activity_scope": ("live process cwd and open files; Codex session metadata is not checked"
+                                 if config.discard_stale else
+                                 "canonical session cwd and open files; later cross-cwd use cannot be inferred")}
     try:
         config.validate_volume()
         before = os.statvfs(config.mount)
