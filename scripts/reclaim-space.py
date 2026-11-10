@@ -237,8 +237,7 @@ class Activity:
 
     def uses_tree(self, path):
         self.fresh()
-        return any(below(name, path) or (fd == "cwd" and below(name, self.root) and below(path, name))
-                   for fd, name in self.paths)
+        return any(below(name, path) for _, name in self.paths)
 
     def uses_file(self, path, info):
         self.fresh()
@@ -356,7 +355,7 @@ def check_ignored_content(path):
         raise Unsafe("worktree contains ignored local content: " + name)
 
 
-def check_contents(path):
+def check_contents(path, discard_stale=False):
     stack, count = [path], 0
     while stack:
         current = stack.pop()
@@ -367,7 +366,7 @@ def check_contents(path):
                     raise Unsafe("nested checkout check exceeded its bound")
                 if "trash" in entry.name.lower():
                     raise Unsafe("excluded content inside worktree")
-                if entry.name in (".planning", "planning"):
+                if not discard_stale and entry.name in (".planning", "planning"):
                     raise Unsafe("planning content inside worktree")
                 if entry.name == ".git":
                     if current != path:
@@ -404,9 +403,12 @@ def reclaim_worktrees(config, worktrees, now, apply):
             if any(value is not None and below(value, path) for value in protected):
                 raise Unsafe("worktree contains the running maintenance program, configuration, reports, or cwd")
             config.bound(row["repo_root"])
-            config.bound(row["git_common_dir"])
+            common = config.bound(row["git_common_dir"])
             if not safe_path(path / ".git").is_file():
                 raise Unsafe("worktree has no Git marker")
+            git_dir = config.bound(text(git(path, "rev-parse", "--absolute-git-dir")))
+            if git_dir.parent != common / "worktrees" or not git_dir.is_dir():
+                raise Unsafe("unexpected worktree Git directory")
             branch, head = row.get("branch"), row.get("head")
             if not branch or branch.startswith("(") or not re.fullmatch(r"[a-f0-9]{40,64}", head or ""):
                 raise Unsafe("detached or unknown worktree identity")
@@ -419,9 +421,9 @@ def reclaim_worktrees(config, worktrees, now, apply):
             check_head(path, branch, head, config.discard_stale)
             if not config.discard_stale:
                 merged_pr(path, branch, head)
-            check_contents(path)
+            check_contents(path, config.discard_stale)
             activity = Activity.capture(config)
-            if activity.uses_tree(path) or activity.uses_tree(Path(row["git_common_dir"])):
+            if activity.uses_tree(path) or activity.uses_tree(git_dir):
                 raise Unsafe("worktree is in use")
             check_head(path, branch, head, config.discard_stale)
             current_sessions = session_paths(config, now)

@@ -51,6 +51,7 @@ class MaintenanceTests(unittest.TestCase):
         self.config = M.Config(self.root, self.mount, "TEST-UUID", BINARY,
                                self.database, self.base / "reports")
         self.original_command = M.command
+        self.cwd_paths = []
         self.open_paths = []
         self.lsof_bad = False
         self.uuid = "TEST-UUID"
@@ -81,10 +82,11 @@ class MaintenanceTests(unittest.TestCase):
             if self.lsof_bad:
                 raise M.Unsafe("lsof failed")
             data = b"p123\0f1\0n/irrelevant-observer-file\0\n"
-            for path in self.open_paths:
-                info = path.stat()
-                data += ("f2\0n%s\0D0x%x\0i%d\0\n" %
-                         (path, info.st_dev, info.st_ino)).encode()
+            for fd, paths in (("cwd", self.cwd_paths), ("2", self.open_paths)):
+                for path in paths:
+                    info = path.stat()
+                    data += ("f%s\0n%s\0D0x%x\0i%d\0\n" %
+                             (fd, path, info.st_dev, info.st_ino)).encode()
             return subprocess.CompletedProcess(args, 0, data, b"")
         if args[0] == "gh":
             row = {"state": self.pr_state, "mergedAt": "2026-01-01T00:00:00Z",
@@ -235,8 +237,10 @@ class MaintenanceTests(unittest.TestCase):
         self.git(self.repo, "remote", "remove", "origin")
         self.ignore(".env.local")
         files = {"source.txt": "discard tracked edit\n", "untracked.txt": "discard untracked\n",
-                 ".env.local": "discard ignored fixture\n"}
+                 ".env.local": "discard ignored fixture\n", "planning/notes.md": "discard notes\n",
+                 ".planning/notes.md": "discard ignored notes\n"}
         for name, content in files.items():
+            (self.linked / name).parent.mkdir(parents=True, exist_ok=True)
             (self.linked / name).write_text(content)
         with patch.object(M, "merged_pr", side_effect=AssertionError("GitHub is not required")):
             result = self.run_maintenance()
@@ -268,13 +272,7 @@ class MaintenanceTests(unittest.TestCase):
         result = self.run_maintenance(True)
         self.assertIn("in use", self.target_result(result)["reason"])
         self.open_paths = []
-        for name in ("planning", ".planning"):
-            directory = self.linked / name
-            directory.mkdir()
-            result = self.run_maintenance(True)
-            self.assertIn("planning", self.target_result(result)["reason"])
-            directory.rmdir()
-        nested = self.linked / "node_modules/nested"
+        nested = self.linked / ".planning/nested"
         nested.mkdir(parents=True)
         self.git(nested, "init", "-b", "main")
         result = self.run_maintenance(True)
@@ -364,13 +362,16 @@ class MaintenanceTests(unittest.TestCase):
     def test_maintenance_paths_and_unknown_status_are_preserved(self):
         self.config.validate_volume()
         rows = M.scan(self.config)
-        for attribute in ("wtrm", "report_dir", "config_path"):
-            with self.subTest(attribute=attribute), patch.object(self.config, attribute, self.linked / "local"):
-                result = M.reclaim_worktrees(self.config, rows, self.now, True)
-                self.assertIn("running maintenance", next(row for row in result if row["path"] == str(self.linked))["reason"])
-        with patch.object(M.Path, "cwd", return_value=self.linked):
-            result = self.run_maintenance(True)
-        self.assertIn("cwd", self.target_result(result)["reason"])
+        for discard in (False, True):
+            self.config.discard_stale = discard
+            for attribute in ("wtrm", "report_dir", "config_path"):
+                with self.subTest(discard_stale=discard, attribute=attribute), \
+                        patch.object(self.config, attribute, self.linked / ".planning/local"):
+                    result = M.reclaim_worktrees(self.config, rows, self.now, True)
+                    self.assertIn("running maintenance", next(row for row in result if row["path"] == str(self.linked))["reason"])
+            with patch.object(M.Path, "cwd", return_value=self.linked):
+                result = self.run_maintenance(True)
+            self.assertIn("cwd", self.target_result(result)["reason"])
         rows = M.scan(self.config)
         next(row for row in rows if row["path"] == str(self.linked))["dirty"] = None
         for discard in (False, True):
@@ -595,10 +596,66 @@ class MaintenanceTests(unittest.TestCase):
             elif path.is_dir():
                 path.rmdir()
         nested.rmdir()
-        planning = self.linked / ".planning"
-        planning.mkdir()
-        result = self.run_maintenance(True)
-        self.assertIn("planning", self.target_result(result)["reason"])
+        for name in ("planning", ".planning"):
+            planning = self.linked / name
+            planning.mkdir()
+            result = self.run_maintenance(True)
+            self.assertIn("planning", self.target_result(result)["reason"])
+            self.assertTrue(planning.exists())
+            planning.rmdir()
+
+    def test_ancestor_cwds_and_shared_git_activity_do_not_block_worktree_removal(self):
+        sibling = self.repo / ".worktrees/sibling"
+        self.git(self.repo, "worktree", "add", "-b", "sibling", str(sibling))
+        sibling_git = Path(self.git(sibling, "rev-parse", "--absolute-git-dir"))
+        head = self.git(self.repo, "rev-parse", "HEAD")
+        common = self.repo / ".git"
+        self.cwd_paths = [self.mount, self.root, self.repo, self.linked.parent, sibling]
+        self.open_paths = [common / "HEAD", common / "objects" / head[:2] / head[2:],
+                           sibling_git / "HEAD", sibling / "source.txt"]
+        self.config.reclaim_cache = False
+        for discard in (False, True):
+            with self.subTest(discard_stale=discard):
+                self.config.discard_stale = discard
+                result = self.run_maintenance()
+                self.assertEqual(self.target_result(result)["action"], "would_remove", result)
+                self.assertTrue(self.linked.exists())
+                self.assertTrue(sibling.exists())
+
+    def test_target_cwd_open_files_and_git_directory_are_preserved(self):
+        nested = self.linked / "node_modules/package"
+        nested.mkdir(parents=True)
+        git_dir = Path(self.git(self.linked, "rev-parse", "--absolute-git-dir"))
+        self.config.reclaim_cache = False
+        for discard in (False, True):
+            self.config.discard_stale = discard
+            for fd, path in (("cwd", self.linked), ("cwd", nested), ("cwd", git_dir),
+                             ("2", self.linked / "source.txt"), ("2", git_dir / "HEAD"),
+                             ("2", git_dir / "index")):
+                with self.subTest(discard_stale=discard, fd=fd, path=path):
+                    self.cwd_paths = [path] if fd == "cwd" else []
+                    self.open_paths = [path] if fd == "2" else []
+                    result = self.run_maintenance(True)
+                    self.assertEqual(self.target_result(result)["action"], "skip", result)
+                    self.assertIn("in use", self.target_result(result)["reason"])
+                    self.assertTrue(self.linked.exists())
+
+    def test_worktree_git_directory_must_be_inside_the_expected_common_directory(self):
+        self.config.discard_stale = True
+        self.config.reclaim_cache = False
+        git_dir = Path(self.git(self.linked, "rev-parse", "--absolute-git-dir"))
+        original_git = M.git
+        for invalid in (self.root, self.repo / ".git", git_dir / "logs"):
+            def unexpected_git(path, *args, **kwargs):
+                if path == self.linked and args == ("rev-parse", "--absolute-git-dir"):
+                    return subprocess.CompletedProcess([], 0, str(invalid).encode(), b"")
+                return original_git(path, *args, **kwargs)
+
+            with self.subTest(git_dir=invalid), patch.object(M, "git", side_effect=unexpected_git):
+                result = self.run_maintenance(True)
+                self.assertEqual(self.target_result(result)["action"], "skip", result)
+                self.assertIn("Git directory", self.target_result(result)["reason"])
+                self.assertTrue(self.linked.exists())
 
     def test_pinned_session_and_open_worktree_are_preserved(self):
         with sqlite3.connect(self.database) as db:
