@@ -268,12 +268,6 @@ class MaintenanceTests(unittest.TestCase):
         result = self.run_maintenance(True)
         self.assertIn("in use", self.target_result(result)["reason"])
         self.open_paths = []
-        with sqlite3.connect(self.database) as db:
-            db.execute("INSERT INTO threads VALUES (?,?,?,?,?)", (str(self.linked), 1, 1, 0, 0))
-        result = self.run_maintenance(True)
-        self.assertIn("session", self.target_result(result)["reason"])
-        with sqlite3.connect(self.database) as db:
-            db.execute("DELETE FROM threads")
         for name in ("planning", ".planning"):
             directory = self.linked / name
             directory.mkdir()
@@ -286,6 +280,46 @@ class MaintenanceTests(unittest.TestCase):
         result = self.run_maintenance(True)
         self.assertIn("nested", self.target_result(result)["reason"])
         self.assertTrue(self.linked.exists())
+
+    def test_discard_stale_skips_session_metadata(self):
+        self.config.created_before = None
+        self.config.inactive = 5 * 86400
+        recent = self.now - 6 * 86400
+        for cwd in (self.root, self.linked):
+            for pinned, archived, stamp in ((0, 0, recent), (1, 1, 0)):
+                with self.subTest(cwd=cwd, pinned=pinned):
+                    with sqlite3.connect(self.database) as db:
+                        db.execute("DELETE FROM threads")
+                        db.execute("INSERT INTO threads VALUES (?,?,?,?,?)",
+                                   (str(cwd), pinned, archived, stamp, stamp))
+                    self.config.discard_stale = False
+                    result = self.run_maintenance()
+                    self.assertIn("session", self.target_result(result)["reason"])
+                    self.config.discard_stale = True
+                    with patch.object(M.sqlite3, "connect", side_effect=AssertionError("session metadata is not required")):
+                        result = self.run_maintenance()
+                    self.assertEqual(self.target_result(result)["action"], "would_remove", result)
+                    self.assertEqual(result["activity_scope"],
+                                     "live process cwd and open files; Codex session metadata is not checked")
+                    self.assertTrue(self.linked.exists())
+        result = self.run_maintenance(True)
+        self.assertEqual(self.target_result(result)["action"], "removed", result)
+        self.assertFalse(self.linked.exists())
+        self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
+
+    def test_discard_stale_does_not_require_session_database(self):
+        self.database.write_bytes(b"not a SQLite database")
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                if missing:
+                    self.database.unlink()
+                self.config.discard_stale = False
+                result = self.run_maintenance()
+                self.assertEqual(result["worktrees"][0]["action"], "skip_all", result)
+                self.config.discard_stale = True
+                result = self.run_maintenance()
+                self.assertEqual(self.target_result(result)["action"], "would_remove", result)
+                self.assertTrue(self.linked.exists())
 
     def test_age_policy_matches_either_threshold_and_rejects_unknown_times(self):
         self.config.created_before = 30 * 86400
@@ -656,6 +690,9 @@ class MaintenanceTests(unittest.TestCase):
         native_entry = [str(install / "wtrm"), "maintain", "--config", str(install / "config.json")]
         self.assertEqual(installed["dry_run"], native_entry)
         self.assertEqual(agent["ProgramArguments"], native_entry + ["--yes"])
+        self.database.unlink()
+        result = subprocess.run(args, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
         result = subprocess.run(args + ["--include-cache", "--discard-stale", "--created-before", "none"],
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
