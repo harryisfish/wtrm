@@ -147,6 +147,29 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(self.linked.exists())
         self.assertEqual((self.linked / "source.txt").read_text(), "source\n")
 
+    def test_initial_scan_errors_stop_dry_run_and_apply(self):
+        scan_args = [str(self.config.wtrm), "--json", str(self.root)]
+
+        def scan_with_error(args, check=True, timeout=60):
+            response = self.fake_command(args, check=check, timeout=timeout)
+            if args == scan_args:
+                result = json.loads(response.stdout)
+                result["errors"] = ["unrelated repository scan error"]
+                response.stdout = json.dumps(result).encode()
+            return response
+
+        with patch.object(M, "command", side_effect=scan_with_error), \
+                patch.object(M, "reclaim_worktrees") as reclaim:
+            for apply in (False, True):
+                with self.subTest(apply=apply):
+                    result = self.run_maintenance(apply)
+                    self.assertEqual(result["status"], "error", result)
+                    self.assertEqual(result["errors"], ["incomplete wtrm scan"])
+                    self.assertEqual(result["worktrees"], [])
+                    self.assertEqual(result["caches"], [])
+            reclaim.assert_not_called()
+        self.assertTrue(self.linked.exists())
+
     def test_delete_rescan_can_complete_after_the_scan_deadline(self):
         original_run = subprocess.run
         for elapsed in (61, 301):
@@ -226,6 +249,67 @@ class MaintenanceTests(unittest.TestCase):
         self.assertFalse(self.linked.exists())
         self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
         self.assertEqual((self.repo / "source.txt").read_text(), "source\n")
+
+    def test_delete_errors_do_not_hide_confirmed_target_removal(self):
+        self.config.discard_stale = True
+        self.config.reclaim_cache = False
+        delete_calls = []
+
+        def delete_with_error(args, check=True, timeout=60):
+            response = self.fake_command(args, check=check, timeout=timeout)
+            if args[:2] == [str(self.config.wtrm), "delete"]:
+                delete_calls.append(args)
+                result = json.loads(response.stdout)
+                result["errors"] = ["unrelated repository scan error"]
+                response.stdout = json.dumps(result).encode()
+                response.returncode = 1
+            return response
+
+        with patch.object(M, "command", side_effect=delete_with_error):
+            for apply in (False, True):
+                with self.subTest(apply=apply):
+                    result = self.run_maintenance(apply)
+                    item = self.target_result(result)
+                    self.assertEqual(item["action"], "removed" if apply else "skip", result)
+                    self.assertEqual(item["warnings"], ["wtrm exited with status 1",
+                                                        "unrelated repository scan error"])
+                    self.assertEqual(self.linked.exists(), not apply)
+        self.assertEqual(len(delete_calls), 2)
+        for args in delete_calls:
+            self.assertEqual(args[args.index("--json") + 2], str(self.repo))
+        self.assertNotIn(str(self.linked), self.git(self.repo, "worktree", "list", "--porcelain"))
+        self.assertTrue(self.git(self.repo, "show-ref", "--verify", "refs/heads/topic"))
+
+    def test_delete_reports_require_confirmed_target_removal(self):
+        self.config.reclaim_cache = False
+        for field, value in (("result", "failed"), ("result", "unknown"), ("action", "clean"),
+                             ("id", "unexpected"), ("path", str(self.repo)), (None, None)):
+            with self.subTest(field=field, value=value):
+                def unverified_delete(args, check=True, timeout=60):
+                    deleting = args[:2] == [str(self.config.wtrm), "delete"]
+                    if deleting and field is None:
+                        args = ["--dry-run" if arg == "--yes" else arg for arg in args]
+                    response = self.fake_command(args, check=check, timeout=timeout)
+                    if deleting:
+                        result = json.loads(response.stdout)
+                        result["items"][0][field or "result"] = value if field else "ok"
+                        result["items"][0]["reason"] = "unverified fixture result"
+                        result["errors"] = ["unrelated repository scan error"]
+                        response.stdout = json.dumps(result).encode()
+                        response.returncode = 1
+                    return response
+
+                with patch.object(M, "command", side_effect=unverified_delete):
+                    result = self.run_maintenance(True)
+                item = self.target_result(result)
+                remains = self.linked.exists()
+                if not remains:
+                    self.git(self.repo, "worktree", "add", str(self.linked), "topic")
+                self.assertEqual(item["action"], "skip", result)
+                self.assertIn("unrelated repository scan error", item["warnings"])
+                self.assertEqual(remains, field is None)
+                if field is None:
+                    self.assertIn("path remains", item["reason"])
 
     def test_discard_stale_removes_local_content_without_a_merged_pr(self):
         self.config.discard_stale = True
